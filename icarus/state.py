@@ -1409,15 +1409,23 @@ def rollback_model():
             )
         }
 
-    before_model = current.get("LLM_MODEL", "")
-    after_model = restorable.get("LLM_MODEL", "")
-    if before_model == after_model and len(restorable) == sum(1 for k in current if managed(k)):
+    # What would actually change: a value that differs, a key the backup adds,
+    # or a managed key the backup drops. Comparing only LLM_MODEL let a call
+    # report "rolled_back" while every managed value already matched.
+    to_write = {}
+    for key, line in restorable.items():
+        if current.get(key) != line:
+            to_write[key] = line
+    to_remove = [k for k in current if managed(k) and k not in restorable]
+    if not to_write and not to_remove:
         return {
             "error": (
                 f"nothing to roll back: live .env already matches {backup.name} "
-                f"for model keys (LLM_MODEL={after_model or '<unset>'})"
+                f"for every managed key ({', '.join(sorted(restorable))})"
             )
         }
+
+    before_model = current.get("LLM_MODEL", "")
 
     # Snapshot the live file first so this operation is reversible.
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
@@ -1430,22 +1438,32 @@ def rollback_model():
 
     lines = env_file.read_text(encoding="utf-8").split("\n") if env_file.exists() else []
     replaced = set()
-    for i, line in enumerate(lines):
+    dropped = set()
+    kept = []
+    for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
+            kept.append(line)
             continue
         key = stripped.split("=", 1)[0].strip()
-        if key in restorable:
-            lines[i] = restorable[key]
+        if key in to_write:
+            kept.append(to_write[key])
             replaced.add(key)
-    appended = [v for k, v in restorable.items() if k not in replaced]
-    while lines and lines[-1] == "":
-        lines.pop()
-    lines.extend(appended)
-    lines.append("")
+            continue
+        if key in to_remove:
+            # The backup has no such managed key, so the rollback removes it —
+            # but only this one line; neighbours are untouched.
+            dropped.add(key)
+            continue
+        kept.append(line)
+    appended = [v for k, v in to_write.items() if k not in replaced]
+    while kept and kept[-1] == "":
+        kept.pop()
+    kept.extend(appended)
+    kept.append("")
 
     tmp = env_file.with_suffix(".env.tmp")
-    tmp.write_text("\n".join(lines), encoding="utf-8")
+    tmp.write_text("\n".join(kept), encoding="utf-8")
     try:
         os.chmod(tmp, 0o600)
     except OSError:
@@ -1457,7 +1475,9 @@ def rollback_model():
     for m in registry["models"]:
         if m.get("active"):
             m["active"] = False
-    restored_model = restorable.get("LLM_MODEL", "").split("=", 1)[-1] if restorable.get("LLM_MODEL") else None
+    restored_model = None
+    if to_write.get("LLM_MODEL"):
+        restored_model = to_write["LLM_MODEL"].split("=", 1)[-1].strip()
     restored_match = None
     for m in registry["models"]:
         if restored_model and m.get("output_model") == restored_model:
@@ -1468,10 +1488,11 @@ def rollback_model():
 
     return {
         "status": "rolled_back",
-        "from_model": before_model.split("=", 1)[-1] if before_model else None,
+        "from_model": before_model.split("=", 1)[-1].strip() if before_model else None,
         "to_model": restored_model,
         "keys_restored": sorted(replaced | set(appended)),
-        "keys_preserved": sorted(k for k in current if k not in restorable),
+        "keys_dropped": sorted(dropped),
+        "keys_preserved": sorted(k for k in current if not managed(k)),
         "safety_copy": str(safety),
     }
 

@@ -96,6 +96,19 @@ try:
     check("second call reports nothing to roll back", "error" in second, json.dumps(second))
 
     print()
+    print("a managed key the backup lacks is dropped, other keys untouched")
+    env.write_text(
+        live.rstrip("\n") + "\nMODEL_QA_EXTRA=stale\nKEEP_ME=1\n",
+        encoding="utf-8",
+    )
+    fourth = state.rollback_model()
+    after = state._env_keys(env)
+    check("rollback reports the drop", "MODEL_QA_EXTRA" in fourth.get("keys_dropped", []), json.dumps(fourth)[:300])
+    check("dropped key is gone", "MODEL_QA_EXTRA" not in after, json.dumps(sorted(after))[:300])
+    check("unmanaged neighbour key survives", after.get("KEEP_ME") == "KEEP_ME=1", json.dumps(after.get("KEEP_ME")))
+    check("embedding key still survives", "sk-embedding-should-survive" in env.read_text())
+
+    print()
     print("a backup with no model keys must be refused")
     (home / ".env.backup.29990101000000").write_text("UNRELATED=x\n", encoding="utf-8")
     third = state.rollback_model()
