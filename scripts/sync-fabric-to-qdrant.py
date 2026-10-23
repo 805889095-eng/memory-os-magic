@@ -257,6 +257,13 @@ def build_point(requests, bm25_tf, path):
         "tier": str(meta.get("tier") or ""),
         "file": path.name,
         "content_hash": hashlib.sha1(text.encode()).hexdigest(),
+        # Reflection lifecycle fields. micro_reflection selects on
+        # `reflection_count < 3` AND `archived == false`; a point missing either
+        # key is silently excluded from every reflection cycle, which is what
+        # happened to every fabric entry before these were added here.
+        "reflection_count": 0,
+        "archived": False,
+        "last_reflected": None,
     }
     vector = {"dense": dense}
     if indices:

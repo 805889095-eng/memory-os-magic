@@ -48,6 +48,10 @@ async def ingest_memory(
         "created_at": timestamp,
         "reflection_count": 0,
         "last_reflected": None,
+        # micro_reflection's filter requires `archived == false`. Without this
+        # key the point is excluded from every reflection pass (Qdrant only
+        # matches points that actually carry the filtered field).
+        "archived": False,
     }
 
     point = PointStruct(
