@@ -1008,7 +1008,31 @@ _COLLAPSE_DEBUG = os.environ.get("ICARUS_COLLAPSE_DEBUG", "0").strip().lower() i
 
 
 def _fabric_text(e):
-    return e.get("summary") or e.get("_body") or e.get("body") or ""
+    """Summary AND body — the summary alone is a one-line title.
+
+    The old ``summary or _body or body`` chain looked reasonable but the
+    summary is always present, so the body was never reached: a fabric
+    candidate entered the collapse ranker as a 33-char headline while every
+    other source carried hundreds of chars. Two consequences, both observed
+    live:
+
+      * query overlap (55% of salience) was computed against a headline that
+        rarely contains the query terms, so fabric ranked far below qdrant and
+        was pruned as noise;
+      * qdrant indexes this same markdown, and its excerpt (title + 400 chars
+        of text) is a strict superset of the 33-char headline — token overlap
+        came out at exactly 1.000, so the near-duplicate filter discarded
+        fabric every time qdrant had the k-th hit.
+
+    Net effect: [fabric] vanished from the injected prompt unless qdrant missed
+    the entry entirely. Both layers are meant to contribute, so give fabric its
+    real text and let the ranker compare like with like.
+    """
+    summary = str(e.get("summary") or "").strip()
+    body = str(e.get("_body") or e.get("body") or "").strip()
+    if summary and body:
+        return f"{summary}\n{body}"
+    return summary or body
 
 
 def _fact_text(f):
@@ -1651,6 +1675,17 @@ def _llm_extract_entries(transcript):
                 continue
             if len(summary) < 10 or len(content) < 60:
                 continue
+            # Strip harness scaffolding the model copies verbatim. A delegated
+            # task arrives wrapped in "## Task\n[ASYNC DELEGATION COMPLETE — id]
+            # \nA background subagent ..." and the model tends to echo that block
+            # (plus a stale earlier "## Decision") into every entry it writes.
+            # One cluster of nine facts shared a 734-char header that was pure
+            # scaffolding; because the strings differed further down, the UNIQUE
+            # content constraint could not collapse them and the header ate the
+            # first 200-char excerpt budget, hiding the real content from search.
+            content = _strip_scaffolding(content)
+            if len(content) < 60:
+                continue
             valid.append(
                 {
                     "type": etype,
@@ -1780,12 +1815,74 @@ def _settle_session_feedback(session_id) -> int:
     return _auto_feedback(session_id, replies)
 
 
+_SCAFFOLD_HEADER_RE = re.compile(
+    r"^##\s*Task\s*\n+\[ASYNC DELEGATION COMPLETE[^\]]*\]\s*\n"
+    r".*?(?=^##\s+(?:Result|Outcome)\b|\Z)"
+    r"|^##\s*Task\s*\n+\[ASYNC DELEGATION COMPLETE[^\]]*\]\s*\n.*",
+    re.M | re.S,
+)
+
+
+def _strip_scaffolding(content: str) -> str:
+    """Drop harness-injected headers from an extracted entry.
+
+    Delegated results reach the transcript inside a fixed envelope::
+
+        ## Task
+        [ASYNC DELEGATION COMPLETE — deleg_xxxx]
+        A background subagent you dispatched earlier has finished. ...
+
+    The model echoes that envelope into the entries it writes, and it also
+    tends to repeat whatever it wrote in an earlier ``## Decision`` section, so
+    nine separate facts ended up sharing a 734-char prefix of pure boilerplate
+    while their real content lived in the last few hundred characters. Two
+    costs: the UNIQUE ``content`` column cannot collapse near-identical rows
+    (the tails differ), and the 200-char excerpt window — the text that is
+    injected into the prompt and scored by the collapse ranker — was entirely
+    boilerplate.
+
+    Only the envelope is removed. Real ``## Decision`` / ``## Result`` sections
+    that the model wrote itself are kept.
+    """
+    text = str(content or "")
+    stripped = _SCAFFOLD_HEADER_RE.sub("", text, count=1)
+    if stripped.strip() != text.strip():
+        text = stripped.lstrip("\n")
+    # A leading "## Task" with no delegation envelope is still harness framing.
+    return text.strip()
+
+
+def _commit_extract_cursor(value: int) -> None:
+    """Record how much of the exchange list extraction has consumed.
+
+    Written to both the module global and the bound session record: the global
+    is what the next call reads after ``bind_session``, the record is what
+    survives a rebind so a compression in the same session does not re-extract.
+    """
+    state.extract_cursor = value
+    rec = getattr(state, "_SESSION_CACHE", {}).get(
+        state.session_id or getattr(state, "_DEFAULT_SESSION_KEY", "")
+    )
+    if rec is not None:
+        rec.extract_cursor = value
+
+
 def on_session_end(session_id="", platform="", completed=False, **kwargs):
     """Score session, extract entries via LLM, fall back to legacy truncation.
 
     Extracted entries are also mirrored into the durable fact store so the
     self-evolution loop has a write path, and this session's injected facts get
     a final usage settlement.
+
+    Only the exchanges appended since the previous call are extracted. Hermes
+    fires ``on_session_end`` at every session boundary it defines — including
+    each context compression (``commit_memory_session``), not just shutdown —
+    so a long conversation triggers this repeatedly with the SAME growing
+    transcript. Without a cursor every compression re-extracted the whole
+    history and wrote it back as new facts: one 9-fact cluster of near-identical
+    entries with a shared 734-char header was produced this way, each differing
+    only past the point where the transcript had grown. Because the strings
+    differ, the UNIQUE ``content`` constraint does not collapse them.
     """
     state.bind_session(session_id)
 
@@ -1798,7 +1895,14 @@ def on_session_end(session_id="", platform="", completed=False, **kwargs):
     if settled:
         logger.info("icarus: session-end rewarded %d fact(s) as helpful", settled)
 
-    if not state.exchanges:
+    # ── Slice to what is new since the last extraction this session ──
+    # Reset when the exchange list shrank (new session bound) so a stale
+    # cursor can never suppress a fresh session's entries.
+    start = state.extract_cursor
+    if start < 0 or start > len(state.exchanges):
+        start = 0
+    fresh = state.exchanges[start:]
+    if not fresh:
         return
 
     scores = state.score_session()
@@ -1808,8 +1912,12 @@ def on_session_end(session_id="", platform="", completed=False, **kwargs):
     plat = platform or "cli"
 
     # ── LLM extraction (primary) ──
-    transcript = _build_transcript(state.exchanges)
+    transcript = _build_transcript(fresh)
     entries = _llm_extract_entries(transcript)
+    # Advance only after a successful extraction attempt, so a transient LLM
+    # failure does not silently drop the turns it covered. Written to the
+    # session record (not just the module global) so it survives a rebind.
+    _commit_extract_cursor(len(state.exchanges))
 
     if entries:
         for entry in entries:

@@ -54,8 +54,38 @@ EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
 EMBEDDING_PASS_DIMENSIONS = os.environ.get("EMBEDDING_PASS_DIMENSIONS", "auto").lower()
 TOP_K_DEFAULT = 3
 SCORE_THRESHOLD_DEFAULT = 0.55
+RRF_K = 60  # Qdrant's RRF constant; score = sum 1/(RRF_K + rank) over prefetches
 MAX_TEXT_LEN = 8000
 REQUEST_TIMEOUT = 10
+
+
+def rrf_threshold(cosine_threshold: float) -> float:
+    """Map a cosine-similarity threshold onto the RRF score range.
+
+    The ranking backends return incomparable numbers. Dense-only returns cosine
+    similarity (0–1, continuous). Hybrid returns Reciprocal Rank Fusion:
+    sum over prefetch lists of 1/(RRF_K + rank), so a single-list hit at rank 0
+    is 1/61 ≈ 0.0164 and at rank 1 is 1/62, while agreement between both lists
+    at rank 0 gives 2/61 ≈ 0.0328. (Qdrant normalises the top hit to ~0.5/1.0
+    in its response, but the ordering and the ratio between one-list and
+    two-list hits are what matter here.)
+
+    Comparing a cosine threshold against RRF scores directly is a category
+    error: 0.72 kept only the handful of points that BOTH the dense and sparse
+    prefetch ranked highly, discarding every lexical-only match — precisely the
+    hits sparse retrieval exists to provide.
+
+    Map by interpreting the caller's threshold as "required confidence": a
+    threshold at or below 0.5 means "accept a single-list hit", above 0.5 means
+    "require corroboration from both lists".
+    """
+    try:
+        t = float(cosine_threshold)
+    except (TypeError, ValueError):
+        return 0.0
+    if t <= 0.5:
+        return 1.0 / (RRF_K + 1)   # a single-prefetch hit qualifies
+    return 2.0 / (RRF_K + 1)       # require both prefetches to agree
 
 # Sparse BM25 hyper-parameters (Qdrant applies the IDF modifier server-side).
 BM25_K1 = float(os.environ.get("BM25_K1", "1.2"))
@@ -394,9 +424,15 @@ def search_knowledge_base(
             if isinstance(raw_results, list)
             else raw_results.get("points", [])
         )
+        # Same scale mismatch as in search_with_fallback: RRF scores top out
+        # near 0.5 per prefetch list, so a cosine threshold would reject every
+        # single-list match. See rrf_threshold().
+        effective_threshold = (
+            rrf_threshold(score_threshold) if sparse is not None else score_threshold
+        )
         for r in points:
             score = r.get("score", 0)
-            if score < score_threshold:
+            if score < effective_threshold:
                 continue
             payload = r.get("payload", {})
             results.append(
@@ -701,9 +737,22 @@ def search_with_fallback(
                 if isinstance(raw_results, list)
                 else raw_results.get("points", [])
             )
+            # RRF fusion scores are 1/(k+rank) and do not share a scale with
+            # cosine similarity: a single-prefetch hit tops out at 1/(60+1)≈0.5
+            # and a two-prefetch agreement at ≈1.0. Applying the cosine-oriented
+            # caller threshold (0.72) to them silently kept only items present
+            # in BOTH prefetch lists, dropping every lexical-only or
+            # semantic-only match. Scale the threshold into the RRF range
+            # instead, so the caller's intent ("how strong must this hit be")
+            # survives a change of backend.
+            effective_threshold = (
+                rrf_threshold(score_threshold)
+                if fallback_level == "hybrid"
+                else score_threshold
+            )
             for r in points:
                 score = r.get("score", 0)
-                if score < score_threshold:
+                if score < effective_threshold:
                     continue
                 payload = r.get("payload", {})
                 results.append(

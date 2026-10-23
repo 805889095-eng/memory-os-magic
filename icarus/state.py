@@ -89,12 +89,17 @@ _DEFAULT_SESSION_KEY = "__no_session__"
 
 
 class _SessionRecord:
-    __slots__ = ("session_id", "exchanges", "recall_log")
+    __slots__ = ("session_id", "exchanges", "recall_log", "extract_cursor")
 
     def __init__(self, session_id=""):
         self.session_id = session_id
         self.exchanges = []
         self.recall_log = []
+        # How many exchanges the LLM extraction has already consumed. Hermes
+        # calls on_session_end at every boundary it defines, including each
+        # context compression, always with the full growing transcript; without
+        # this cursor the same history was re-extracted on every compression.
+        self.extract_cursor = 0
 
 
 def _session_record(session_id=""):
@@ -118,7 +123,7 @@ def bind_session(sid="", reset=False):
     ``reset`` starts a fresh record (session start) instead of reusing the
     existing one. Returns the bound record.
     """
-    global session_id, exchanges, _recall_log
+    global session_id, exchanges, _recall_log, extract_cursor
     key = sid or _DEFAULT_SESSION_KEY
     if reset:
         _SESSION_CACHE.pop(key, None)
@@ -126,11 +131,13 @@ def bind_session(sid="", reset=False):
     session_id = rec.session_id
     exchanges = rec.exchanges
     _recall_log = rec.recall_log
+    extract_cursor = rec.extract_cursor
     return rec
 
 
 session_id = ""
 exchanges: list = []
+extract_cursor = 0
 
 # ── Training job tracking ────────────────────────────────
 _JOB_FILE = (HERMES_HOME or Path.home()) / ".icarus-training-job.txt"

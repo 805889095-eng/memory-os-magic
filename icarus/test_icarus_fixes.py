@@ -337,6 +337,60 @@ check(
     repr(_ex2[-60:]),
 )
 
+# ── 12. extraction must not re-consume the whole transcript ───────────────
+# Hermes fires on_session_end at every boundary it defines, including each
+# context compression, always with the full growing transcript. Without a
+# cursor each compression re-extracted all prior turns and wrote them back as
+# new facts (a 9-row cluster of near-identical entries sharing a 734-char
+# header). The cursor must advance, survive a rebind, and reset on a new
+# session.
+print("\n12. extraction cursor")
+
+state.bind_session("cursor-regression", reset=True)
+check("fresh session starts at zero", state.extract_cursor == 0, str(state.extract_cursor))
+
+state.exchanges.extend(
+    [{"user": "u1", "assistant": "a" * 120}, {"user": "u2", "assistant": "b" * 120}]
+)
+check("first pass sees everything", len(state.exchanges[state.extract_cursor:]) == 2)
+
+hooks._commit_extract_cursor(len(state.exchanges))
+check("cursor advanced past consumed turns",
+      len(state.exchanges[state.extract_cursor:]) == 0, str(state.extract_cursor))
+
+state.exchanges.append({"user": "u3", "assistant": "c" * 120})
+check("only the new turn is pending",
+      len(state.exchanges[state.extract_cursor:]) == 1, str(state.extract_cursor))
+
+# Cursor holds the last COMMITTED position (2), not len() — the pending turn
+# stays pending across a rebind, which is the property under test.
+state.bind_session("cursor-regression")
+check("cursor survives a rebind", state.extract_cursor == 2, str(state.extract_cursor))
+check("pending turn still pending after rebind",
+      len(state.exchanges[state.extract_cursor:]) == 1, str(state.extract_cursor))
+
+state.bind_session("cursor-regression", reset=True)
+check("cursor resets on a new session", state.extract_cursor == 0, str(state.extract_cursor))
+
+# ── 13. harness scaffolding must be stripped from extracted content ───────
+print("\n13. scaffolding strip")
+
+_envelope = (
+    "## Task\n[ASYNC DELEGATION COMPLETE — deleg_abc123]\n"
+    "A background subagent you dispatched earlier has finished. "
+    "You may have moved on since dispatching it; the full task source is below.\n\n"
+    "## Decision\n旧的一轮内容，被模型抄进了每一条。\n\n"
+    "## Result\n真正的结论在这里，长度足够通过校验。"
+)
+_out = hooks._strip_scaffolding(_envelope)
+check("delegation envelope removed", "ASYNC DELEGATION" not in _out, repr(_out[:50]))
+check("stale decision removed", "旧的一轮内容" not in _out, repr(_out[:50]))
+check("real result kept", "真正的结论" in _out, repr(_out[:60]))
+check("strip is idempotent", hooks._strip_scaffolding(_out) == _out)
+
+_plain = "## Context\n普通条目。\n\n## Outcome\n完成。"
+check("normal entry untouched", hooks._strip_scaffolding(_plain) == _plain)
+
 print("\n" + "=" * 64)
 print(f"pass {len(PASS)} / fail {len(FAIL)}")
 for label, detail in FAIL:
