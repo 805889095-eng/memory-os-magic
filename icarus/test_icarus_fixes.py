@@ -681,6 +681,86 @@ check(
     str(_report.get("notes")),
 )
 
+# ── 15. fact ranking must not be decided by retrieval_count alone ────────
+# rank_score multiplied trust by (1 + 0.15*log1p(retrieval_count)). Every fact
+# starts at the same trust (INITIAL_TRUST 0.55), so the usage term was the only
+# differentiator, and it is unbounded: at ret=18 it multiplies the score by 1.44.
+# Consequence on the live store: 18 of 29 facts sat at retrieval_count=0 and
+# could not recall THEMSELVES — a query built from a fact's own opening text
+# returned the same six hot facts every time. FTS had them at rank 1-3; the
+# rerank pushed them to 13-20 or out of the candidate pool entirely.
+print("\n15. fact rerank must not starve unretrieved facts")
+
+_starv_root = Path(tempfile.mkdtemp(prefix="icarus_rank_", dir=SCRATCH))
+_starv_db = _starv_root / "memory_store.db"
+_saved_env = os.environ.get("MEMORY_STORE_PATH")
+_saved_home = getattr(state, "HERMES_HOME", None)
+os.environ["MEMORY_STORE_PATH"] = str(_starv_db)
+state.HERMES_HOME = _starv_root
+try:
+    # A hot fact that happens to contain one query word, in an unrelated
+    # context, and is retrieved constantly.
+    _hot = "## Result 缓存策略调整：上限从 512 改为 256，重启后生效。之前讨论过 docker 一次。"
+    # A cold fact that is actually about what is being asked.
+    _cold = (
+        "## Decision docker 部署必须先把 compose 文件里的镜像 tag 固定到具体版本，"
+        "不要用 latest，否则回滚时找不到对应镜像。"
+    )
+    _hot_id = evolution.record_fact(_hot)
+    _cold_id = evolution.record_fact(_cold)
+
+    _con = evolution.connect()
+    _con.execute("UPDATE facts SET retrieval_count=18 WHERE fact_id=?", (_hot_id,))
+    _con.commit()
+    _con.close()
+
+    _res = hooks._search_facts("docker 部署", top_k=5)
+    _ids = [r["fact_id"] for r in _res]
+    check(
+        "an exact match outranks a merely-mentioned hot fact",
+        bool(_ids) and _ids[0] == _cold_id,
+        f"top={_ids[0] if _ids else None}, expected {_cold_id} (order {_ids})",
+    )
+
+    # A cold fact must still be able to recall itself even with a crowded
+    # candidate pool. Two facts is not enough to show starvation — add filler
+    # so the top_k window is genuinely contested.
+    for _i in range(8):
+        evolution.record_fact(f"## Note 无关条目编号{_i}：缓存策略与部署流程的通用说明。")
+    _self = hooks._search_facts(_cold, top_k=3)
+    check(
+        "an unretrieved fact can recall itself in a crowded pool",
+        _cold_id in [r["fact_id"] for r in _self],
+        str([r["fact_id"] for r in _self]),
+    )
+
+    # The usage term still has to reward genuinely-used facts — just enough to
+    # break ties, not enough to override relevance. Both facts match here, so
+    # the tie-break should favour the hot one.
+    _tie_hot = evolution.record_fact("## Note 缓存策略：LRU 上限 512 条。")
+    _tie_cold = evolution.record_fact("## Note 缓存策略：LRU 上限 256 条。")
+    _con = evolution.connect()
+    _con.execute("UPDATE facts SET retrieval_count=40 WHERE fact_id=?", (_tie_hot,))
+    _con.commit()
+    _con.close()
+    check(
+        "usage still breaks ties between equally relevant facts",
+        evolution.rank_score(0.55, 40, 0) > evolution.rank_score(0.55, 0, 0),
+        str(evolution.rank_score(0.55, 40, 0)),
+    )
+    # ...but the bonus is bounded: high counts must not multiply the score.
+    check(
+        "usage bonus is bounded, not multiplicative",
+        evolution.rank_score(0.55, 10_000, 0) < 0.55 * 1.5,
+        f"score at ret=10000 is {evolution.rank_score(0.55, 10_000, 0):.3f}",
+    )
+finally:
+    if _saved_env is None:
+        os.environ.pop("MEMORY_STORE_PATH", None)
+    else:
+        os.environ["MEMORY_STORE_PATH"] = _saved_env
+    state.HERMES_HOME = _saved_home
+
 print("\n" + "=" * 64)
 print(f"pass {len(PASS)} / fail {len(FAIL)}")
 for label, detail in FAIL:

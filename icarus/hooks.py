@@ -881,7 +881,7 @@ def _search_facts(query, top_k=3):
         if ascii_query:
             rows = cur.execute(
                 """
-                SELECT f.*
+                SELECT f.*, bm25(facts_fts) AS _bm25
                 FROM facts_fts
                 JOIN facts f ON f.fact_id = facts_fts.rowid
                 WHERE facts_fts MATCH ?
@@ -920,6 +920,39 @@ def _search_facts(query, top_k=3):
         rows = [r for r in rows if (r["_hits"] or 0) >= need]
 
     scored = []
+    # Relevance weight. This is the term the old scoring was missing entirely: it
+    # ordered by trust x usage x recency — all properties of the FACT, none of
+    # them looking at the query — so a hot but tangential fact beat an exact one.
+    #
+    # Two sources, because a mixed query ("docker 部署") only reaches FTS with its
+    # ASCII half: cjk_tokens.fts_query returns '"docker"' and the Chinese bigram
+    # "部署" is dropped entirely, so BM25 cannot distinguish facts by it. Score
+    # the CJK hit ratio separately and combine.
+    #
+    # bm25() is negative (more negative = better) and its magnitude scales with
+    # the query and corpus, so it is normalised against this candidate set: best
+    # -> 1.0, worst -> ~0.
+    def _bm25_relevance(rows_):
+        out = {}
+        vals = [r["_bm25"] for r in rows_ if "_bm25" in set(r.keys()) and r["_bm25"] is not None]
+        if not vals:
+            return out
+        best, worst = min(vals), max(vals)
+        span = (worst - best) or 1.0
+        for r in rows_:
+            if "_bm25" in set(r.keys()) and r["_bm25"] is not None:
+                out[int(r["fact_id"])] = 1.0 - ((r["_bm25"] - best) / span)
+        return out
+
+    _rel_bm25 = _bm25_relevance(rows)
+
+    def _cjk_relevance(content_: str):
+        """Fraction of the query's Han bigrams present in the fact."""
+        if not cjk_terms:
+            return None
+        hit = sum(1 for t in cjk_terms if t in (content_ or ""))
+        return hit / len(cjk_terms)
+
     for r in rows:
         content = r["content"]
         if not content:
@@ -930,6 +963,20 @@ def _search_facts(query, top_k=3):
         age = evolution.fact_age_days(
             r["updated_at"] if "updated_at" in keys else r["created_at"]
         )
+
+        # Combine the two relevance signals. A fact that satisfies both the ASCII
+        # and the Han half of the query should beat one that satisfies only the
+        # ASCII half, which pure BM25 cannot express.
+        _rb = _rel_bm25.get(int(r["fact_id"]))
+        _rc = _cjk_relevance(content)
+        if _rb is None and _rc is None:
+            _rel = None
+        elif _rb is None:
+            _rel = _rc
+        elif _rc is None:
+            _rel = _rb
+        else:
+            _rel = 0.5 * _rb + 0.5 * _rc
 
         # Excerpt around the match, not the first 200 chars. FTS matched the
         # full text, but a head slice can contain none of the query terms: one
@@ -943,7 +990,7 @@ def _search_facts(query, top_k=3):
             "content": excerpt,
             "trust_score": float(trust or 0.0),
             "retrieval_count": int(count or 0),
-            "score": evolution.rank_score(trust, count, age),
+            "score": evolution.rank_score(trust, count, age, relevance=_rel),
         }
         scored.append(rec)
 

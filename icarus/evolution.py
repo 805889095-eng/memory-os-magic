@@ -47,6 +47,14 @@ DECAY_RATE = 0.02  # per-run trust decay for long-unused facts
 DECAY_DAYS = 30  # "unused" age threshold (days) for decay
 RANK_HALF_LIFE_DAYS = 180.0  # recency half-life used by rank_score
 RANK_USE_GAIN = 0.15  # weight of the log1p(retrieval_count) usage term
+# Ceiling on the usage bonus. The term used to be a bare multiplier, so with
+# every fact at the same starting trust (INITIAL_TRUST 0.55) retrieval_count was
+# the only differentiator and a never-retrieved fact could not outrank a hot one
+# regardless of relevance: at ret=18 the factor is 1.44x. On the live store that
+# left 18 of 29 facts at retrieval_count=0, unable to recall themselves — FTS
+# ranked them 1st-3rd and the rerank pushed them to 13th-20th. Bounding the
+# bonus keeps "used facts rise" while letting relevance and trust decide.
+RANK_USE_CAP = 0.25
 
 TOP_USED_DEFAULT = 10
 
@@ -167,10 +175,24 @@ def fact_age_days(timestamp) -> float:
     return 0.0
 
 
-def rank_score(trust, retrieval_count, age_days) -> float:
-    """Rank facts for injection: trust × usage bonus × recency decay.
+def rank_score(trust, retrieval_count, age_days, relevance=None) -> float:
+    """Rank facts for injection: (trust + bounded usage bonus) × relevance × recency.
 
-    ``trust * (1 + RANK_USE_GAIN*log1p(retrieval_count)) * exp(-ln2*age/half_life)``
+    ``relevance`` is the query-match signal, in [0, 1]. It was previously absent
+    from the ranking entirely: the score was trust × usage × recency, all three
+    of which are properties of the fact and none of which look at the query. With
+    every fact at the same starting trust, that reduced to "retrieval_count wins",
+    so a hot but tangential fact beat an exact match and never-retrieved facts
+    could not surface at all (18 of 29 on the live store).
+
+    ``relevance=None`` means "unknown" (the CJK LIKE path has no BM25) and scores
+    a neutral 1.0 so that path keeps its old ordering behaviour.
+
+    The usage bonus is now additive and capped by ``RANK_USE_CAP`` instead of a
+    multiplicative ``(1 + gain*log1p(n))``. At ret=18 the old factor was 1.44x,
+    which no trust or relevance difference could overcome; the capped bonus tops
+    out at +0.25 absolute, so it breaks ties between comparable facts without
+    letting popularity override match quality.
     """
     try:
         trust_f = float(trust) if trust is not None else 0.0
@@ -186,9 +208,21 @@ def rank_score(trust, retrieval_count, age_days) -> float:
         age_f = 0.0
     count_f = max(0.0, count_f)
     age_f = max(0.0, age_f)
+
+    usage_bonus = min(RANK_USE_CAP, RANK_USE_GAIN * math.log1p(count_f))
+
+    if relevance is None:
+        relevance_f = 1.0
+    else:
+        try:
+            relevance_f = float(relevance)
+        except (TypeError, ValueError):
+            relevance_f = 1.0
+        relevance_f = max(0.0, min(1.0, relevance_f))
+
     return (
-        trust_f
-        * (1.0 + RANK_USE_GAIN * math.log1p(count_f))
+        (trust_f + usage_bonus)
+        * relevance_f
         * math.exp(-math.log(2.0) * age_f / RANK_HALF_LIFE_DAYS)
     )
 
