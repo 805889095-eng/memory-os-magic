@@ -24,17 +24,35 @@ from typing import List, Dict, Optional
 from pathlib import Path
 
 # ─── Config ────────────────────────────────────────────────────────────────
-OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
+# Dense embedding — remote only (unified config contract)
+EMBEDDING_API_BASE = os.environ.get(
+    "EMBEDDING_API_BASE", "https://openrouter.ai/api/v1"
+)
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "qwen/qwen3-embedding-8b")
+EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
+EMBEDDING_PASS_DIMENSIONS = os.environ.get("EMBEDDING_PASS_DIMENSIONS", "auto").lower()
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 COLLECTION = os.environ.get("QDRANT_COLLECTION", "knowledge_base")
-if not OPENROUTER_KEY:
+
+
+def _resolve_key() -> str:
+    """EMBEDDING_API_KEY → OPENROUTER_API_KEY (OpenRouter base) → ~/.env."""
+    key = os.environ.get("EMBEDDING_API_KEY") or ""
+    if key:
+        return key
+    if "openrouter" in EMBEDDING_API_BASE.lower():
+        key = os.environ.get("OPENROUTER_API_KEY") or ""
+        if key:
+            return key
     _env = Path.home() / ".env"
     if _env.exists():
         for ln in _env.read_text().splitlines():
-            if ln.startswith("OPENROUTER_API_KEY="):
-                OPENROUTER_KEY = ln.split("=", 1)[1].strip().strip('"')
-                break
-EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
+            if ln.startswith("EMBEDDING_API_KEY="):
+                return ln.split("=", 1)[1].strip().strip('"')
+    return ""
+
+
+OPENROUTER_KEY = _resolve_key()
 TOP_K = 5
 SCORE_THRESHOLD = 0.60
 WARN_THRESHOLD = 0.75          # docs wiki pura precisam de score mais alto para aviso
@@ -45,11 +63,23 @@ REQUEST_TIMEOUT = 10
 
 # ─── Restriction Patterns in wiki text ─────────────────────────────────────
 RESTRICTION_KEYWORDS = [
+    # Portuguese / Spanish
     "não usar", "não deve", "não pode", "nunca usar", "evitar",
     "proibido", "não recomendado", "anti-padrão", "erro comum",
     "cuidado", "atenção", "importante:", "⚠️", "🚫",
     "deve usar", "deve sempre", "requer", "obrigatório",
     "manter", "não alterar", "não modificar", "congelar",
+    # English
+    "do not use", "don't use", "must not", "never use", "avoid",
+    "prohibited", "deprecated", "anti-pattern", "common error",
+    "warning", "caution", "important", "breaking change",
+    "must use", "always use", "required", "mandatory",
+    "freeze", "do not modify", "do not change",
+    # Chinese (中文关键禁忌/规则)
+    "禁止", "严禁", "切勿", "不要使用", "不要用", "避免",
+    "不推荐", "反模式", "常见错误", "坑", "踩坑",
+    "注意", "警告", "重要", "必须", "务必", "强制要求",
+    "保持现状", "不要修改", "不可改动", "冻结",
 ]
 
 def contains_restriction(text: str) -> bool:
@@ -86,16 +116,37 @@ def infer_domain_tags(description: str) -> List[str]:
 def embed_text(text: str) -> Optional[List[float]]:
     if not OPENROUTER_KEY:
         return None
+    payload: dict = {
+        "model": EMBEDDING_MODEL,
+        "input": text[:8000],
+    }
+    should_pass_dims = EMBEDDING_PASS_DIMENSIONS == "true" or (
+        EMBEDDING_PASS_DIMENSIONS == "auto" and "text-embedding-3" in EMBEDDING_MODEL.lower()
+    )
+    if should_pass_dims:
+        payload["dimensions"] = EMBEDDING_DIMS
+
     try:
         r = requests.post(
-            "https://openrouter.ai/api/v1/embeddings",
+            f"{EMBEDDING_API_BASE.rstrip('/')}/embeddings",
             headers={
                 "Authorization": f"Bearer {OPENROUTER_KEY}",
                 "Content-Type": "application/json"
             },
-            json={"model": EMBEDDING_MODEL, "input": text[:8000]},
+            json=payload,
             timeout=REQUEST_TIMEOUT
         )
+        if r.status_code == 400 and ("20015" in r.text or "dimensions" in r.text.lower()) and "dimensions" in payload:
+            payload.pop("dimensions", None)
+            r = requests.post(
+                f"{EMBEDDING_API_BASE.rstrip('/')}/embeddings",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json=payload,
+                timeout=REQUEST_TIMEOUT
+            )
         r.raise_for_status()
         return r.json()["data"][0]["embedding"]
     except Exception as e:

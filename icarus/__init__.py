@@ -25,6 +25,10 @@ Daily driver:
   fabric_brief         — operational brief: pending, recent work, suggested action
   fabric_telemetry     — retrieval/usage stats: what gets recalled, what gets used
 
+Self-evolution (durable fact store):
+  fact_feedback           — score a fact helpful/unhelpful (trust nudge)
+  memory_evolution_stats  — fact-store size, average trust, most-used facts
+
 Hooks (automatic):
   on_session_start  — loads SOUL, pending handoffs, recent context
   pre_llm_call      — injects relevant memories on topic change
@@ -41,44 +45,122 @@ logger = logging.getLogger(__name__)
 
 def register(ctx):
     # memory
-    ctx.register_tool(name="fabric_recall", toolset="fabric",
-                      schema=schemas.FABRIC_RECALL, handler=tools.fabric_recall)
-    ctx.register_tool(name="fabric_write", toolset="fabric",
-                      schema=schemas.FABRIC_WRITE, handler=tools.fabric_write)
-    ctx.register_tool(name="fabric_search", toolset="fabric",
-                      schema=schemas.FABRIC_SEARCH, handler=tools.fabric_search)
-    ctx.register_tool(name="fabric_pending", toolset="fabric",
-                      schema=schemas.FABRIC_PENDING, handler=tools.fabric_pending)
-    ctx.register_tool(name="fabric_curate", toolset="fabric",
-                      schema=schemas.FABRIC_CURATE, handler=tools.fabric_curate)
+    ctx.register_tool(
+        name="fabric_recall",
+        toolset="fabric",
+        schema=schemas.FABRIC_RECALL,
+        handler=tools.fabric_recall,
+    )
+    ctx.register_tool(
+        name="fabric_write",
+        toolset="fabric",
+        schema=schemas.FABRIC_WRITE,
+        handler=tools.fabric_write,
+    )
+    ctx.register_tool(
+        name="fabric_search",
+        toolset="fabric",
+        schema=schemas.FABRIC_SEARCH,
+        handler=tools.fabric_search,
+    )
+    ctx.register_tool(
+        name="fabric_pending",
+        toolset="fabric",
+        schema=schemas.FABRIC_PENDING,
+        handler=tools.fabric_pending,
+    )
+    ctx.register_tool(
+        name="fabric_curate",
+        toolset="fabric",
+        schema=schemas.FABRIC_CURATE,
+        handler=tools.fabric_curate,
+    )
 
     # training
-    ctx.register_tool(name="fabric_export", toolset="fabric",
-                      schema=schemas.FABRIC_EXPORT, handler=tools.fabric_export)
-    ctx.register_tool(name="fabric_train", toolset="fabric",
-                      schema=schemas.FABRIC_TRAIN, handler=tools.fabric_train)
-    ctx.register_tool(name="fabric_train_status", toolset="fabric",
-                      schema=schemas.FABRIC_TRAIN_STATUS, handler=tools.fabric_train_status)
+    ctx.register_tool(
+        name="fabric_export",
+        toolset="fabric",
+        schema=schemas.FABRIC_EXPORT,
+        handler=tools.fabric_export,
+    )
+    ctx.register_tool(
+        name="fabric_train",
+        toolset="fabric",
+        schema=schemas.FABRIC_TRAIN,
+        handler=tools.fabric_train,
+    )
+    ctx.register_tool(
+        name="fabric_train_status",
+        toolset="fabric",
+        schema=schemas.FABRIC_TRAIN_STATUS,
+        handler=tools.fabric_train_status,
+    )
 
     # replacement models
-    ctx.register_tool(name="fabric_models", toolset="fabric",
-                      schema=schemas.FABRIC_MODELS, handler=tools.fabric_models)
-    ctx.register_tool(name="fabric_eval", toolset="fabric",
-                      schema=schemas.FABRIC_EVAL, handler=tools.fabric_eval)
-    ctx.register_tool(name="fabric_switch_model", toolset="fabric",
-                      schema=schemas.FABRIC_SWITCH_MODEL, handler=tools.fabric_switch_model)
-    ctx.register_tool(name="fabric_rollback_model", toolset="fabric",
-                      schema=schemas.FABRIC_ROLLBACK_MODEL, handler=tools.fabric_rollback_model)
+    ctx.register_tool(
+        name="fabric_models",
+        toolset="fabric",
+        schema=schemas.FABRIC_MODELS,
+        handler=tools.fabric_models,
+    )
+    ctx.register_tool(
+        name="fabric_eval",
+        toolset="fabric",
+        schema=schemas.FABRIC_EVAL,
+        handler=tools.fabric_eval,
+    )
+    ctx.register_tool(
+        name="fabric_switch_model",
+        toolset="fabric",
+        schema=schemas.FABRIC_SWITCH_MODEL,
+        handler=tools.fabric_switch_model,
+    )
+    ctx.register_tool(
+        name="fabric_rollback_model",
+        toolset="fabric",
+        schema=schemas.FABRIC_ROLLBACK_MODEL,
+        handler=tools.fabric_rollback_model,
+    )
 
     # daily driver
-    ctx.register_tool(name="fabric_brief", toolset="fabric",
-                      schema=schemas.FABRIC_BRIEF, handler=tools.fabric_brief)
-    ctx.register_tool(name="fabric_telemetry", toolset="fabric",
-                      schema=schemas.FABRIC_TELEMETRY, handler=tools.fabric_telemetry)
-    ctx.register_tool(name="fabric_init_obsidian", toolset="fabric",
-                      schema=schemas.FABRIC_INIT_OBSIDIAN, handler=tools.fabric_init_obsidian)
-    ctx.register_tool(name="fabric_report", toolset="fabric",
-                      schema=schemas.FABRIC_REPORT, handler=tools.fabric_report)
+    ctx.register_tool(
+        name="fabric_brief",
+        toolset="fabric",
+        schema=schemas.FABRIC_BRIEF,
+        handler=tools.fabric_brief,
+    )
+    ctx.register_tool(
+        name="fabric_telemetry",
+        toolset="fabric",
+        schema=schemas.FABRIC_TELEMETRY,
+        handler=tools.fabric_telemetry,
+    )
+    ctx.register_tool(
+        name="fabric_init_obsidian",
+        toolset="fabric",
+        schema=schemas.FABRIC_INIT_OBSIDIAN,
+        handler=tools.fabric_init_obsidian,
+    )
+    ctx.register_tool(
+        name="fabric_report",
+        toolset="fabric",
+        schema=schemas.FABRIC_REPORT,
+        handler=tools.fabric_report,
+    )
+
+    # self-evolution (durable fact store)
+    ctx.register_tool(
+        name="fact_feedback",
+        toolset="fabric",
+        schema=schemas.FACT_FEEDBACK,
+        handler=tools.fact_feedback,
+    )
+    ctx.register_tool(
+        name="memory_evolution_stats",
+        toolset="fabric",
+        schema=schemas.MEMORY_EVOLUTION_STATS,
+        handler=tools.memory_evolution_stats,
+    )
 
     # hooks
     ctx.register_hook("on_session_start", hooks.on_session_start)
@@ -86,4 +168,4 @@ def register(ctx):
     ctx.register_hook("post_llm_call", hooks.post_llm_call)
     ctx.register_hook("on_session_end", hooks.on_session_end)
 
-    logger.info("icarus v3 registered (16 tools, 4 hooks)")
+    logger.info("icarus v3 registered (18 tools, 4 hooks)")

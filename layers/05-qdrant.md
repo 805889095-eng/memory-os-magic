@@ -87,7 +87,7 @@ Redis queue (ARQ job)
     ▼
 ARQ Worker (Docker)
     │ embed via configured backend (default: Qwen3-Embedding-8B)
-    │ get_sparse_embedding() → BM25 (fastembed, local)
+    │ get_sparse_embedding() → BM25 tf (pure Python) → Qdrant applies IDF
     ▼
 Qdrant upsert (with dedup check)
 ```

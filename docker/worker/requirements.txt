@@ -1,8 +1,7 @@
-redis>=5.0.0
-qdrant-client>=1.17.0
-httpx>=0.28.0
-arq>=0.28.0
-pydantic>=2.12.0
-python-dotenv>=1.0.0
-pyyaml>=6.0
-fastembed>=0.8.0
+redis>=5.0.0,<6
+qdrant-client>=1.17.0,<1.19
+httpx>=0.28.0,<1
+arq>=0.28.0,<0.29
+pydantic>=2.12.0,<3
+python-dotenv>=1.0.0,<2
+pyyaml>=6.0,<7

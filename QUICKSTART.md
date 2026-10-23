@@ -8,7 +8,7 @@ curl -sSL https://raw.githubusercontent.com/ClaudioDrews/memory-os/main/setup.sh
 
 This installs everything: Docker stack (Redis + Qdrant + Worker), Icarus plugin, SQLite databases, wiki vault, and environment variables. Safe to re-run — all steps are idempotent.
 
-**Requires:** Docker, Python 3.11+, Hermes Agent. The script auto-detects your OpenRouter key and prompts only if missing.
+**Requires:** Docker, Python 3.11+, Hermes Agent, and a remote embedding/LLM API key. The script auto-detects your OpenRouter key and prompts only if missing.
 
 > Prefer manual control? Follow [setup/install.md](setup/install.md) — step-by-step guide with validation checkpoints.
 
@@ -17,7 +17,7 @@ This installs everything: Docker stack (Redis + Qdrant + Worker), Icarus plugin,
 - **Docker** (Docker Compose v2)
 - **Python 3.11+**
 - **Hermes Agent** (v0.14.0 or later)
-- **OpenRouter API key** (or local Ollama for embeddings)
+- **Remote embedding + LLM API key** (OpenRouter or any OpenAI-compatible endpoint; remote-only — nothing is downloaded or run in-process)
 
 ## 1. Clone
 

@@ -1,34 +1,22 @@
 """
-BM25 Sparse Embedding client via FastEmbed.
-Caches the model in memory (lazy init).
+Pure-Python BM25 tf 编码，无模型无网络。
+
+No local model is loaded and no network call is made: this module simply
+forwards to the dependency-free ``services.bm25_tf.bm25_tf`` implementation.
 """
 import logging
-from fastembed.sparse import SparseTextEmbedding
+
+from services.bm25_tf import bm25_tf
 
 logger = logging.getLogger("cognitive-worker.sparse_embedding")
-
-BM25_MODEL = "Qdrant/bm25"
-_model = None
-
-
-def _get_model() -> SparseTextEmbedding:
-    """Lazy init of the FastEmbed BM25 model."""
-    global _model
-    if _model is None:
-        logger.info("Loading BM25 sparse embedding model...")
-        _model = SparseTextEmbedding(model_name=BM25_MODEL)
-        logger.info("BM25 model loaded.")
-    return _model
 
 
 def get_sparse_embedding(text: str) -> dict:
     """
-    Generates BM25 sparse embedding via FastEmbed.
-    Returns a Qdrant-compatible dict: {"indices": [...], "values": [...]}
+    Generates a BM25 sparse embedding in pure Python.
+
+    Returns a Qdrant-compatible dict: {"indices": [...], "values": [...]}.
+    Only the BM25 tf term is produced; ``idf`` is applied server-side by
+    Qdrant (``Modifier.IDF``). No model, no network, no heavy dependency.
     """
-    model = _get_model()
-    sparse = list(model.embed(text))[0]
-    return {
-        "indices": sparse.indices.tolist(),
-        "values": sparse.values.tolist(),
-    }
+    return bm25_tf(text)

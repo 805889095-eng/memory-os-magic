@@ -14,6 +14,7 @@ Environment:
     QDRANT_HOST           Qdrant host (default: localhost)
     QDRANT_PORT           Qdrant port (default: 6333)
     COLLECTION_NAME       Qdrant collection (default: knowledge_base)
+    WIKI_ROOT             Host wiki root (default: ~/vault/wiki)
 
 Returns exit code 0 on success, 1 on failure.
 """
@@ -23,9 +24,9 @@ import hashlib
 import json
 import os
 import sys
-import tempfile
 import time
 import uuid
+from pathlib import Path
 
 
 # ── Config from env ──────────────────────────────────────────────────────────
@@ -65,12 +66,17 @@ async def main() -> None:
 
     # ── 1. Create temp file for the worker to ingest ──────────────────────────
     print("1. Creating test document...")
-    # The worker reads from the wiki volume mounted in Docker.
-    # Write to /tmp as a fallback; the worker path depends on volume config.
-    tmpdir = tempfile.mkdtemp(prefix="memoryos-test-")
-    test_file = os.path.join(tmpdir, f"ingestion-test-{TEST_ID}.md")
-    with open(test_file, "w") as f:
-        f.write(f"# Test {TEST_ID}\n\n{TEST_TEXT}\n")
+    # The ARQ worker runs inside Docker and reads the wiki volume mounted at
+    # /wiki, so the file MUST be written under the HOST wiki root (WIKI_ROOT)
+    # to be visible to the container. A host tempdir is invisible to the
+    # worker and would make the job fail with FileNotFoundError.
+    wiki_root = Path(
+        os.environ.get("WIKI_ROOT", str(Path.home() / "vault" / "wiki"))
+    )
+    test_dir = wiki_root / "raw" / "test"
+    test_dir.mkdir(parents=True, exist_ok=True)
+    test_file = test_dir / f"ingestion-test-{TEST_ID}.md"
+    test_file.write_text(f"# Test {TEST_ID}\n\n{TEST_TEXT}\n", encoding="utf-8")
     ok(f"Created {test_file}")
 
     # ── 2. Enqueue ARQ job ───────────────────────────────────────────────────
@@ -170,9 +176,8 @@ async def main() -> None:
     )
     ok(f"Deleted point {point_id}")
 
-    # Clean up local temp file
-    os.remove(test_file)
-    os.rmdir(tmpdir)
+    # Clean up the host-side test file
+    Path(test_file).unlink(missing_ok=True)
 
     await client.close()
     await redis.close()

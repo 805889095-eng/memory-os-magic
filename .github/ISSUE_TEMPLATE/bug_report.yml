@@ -35,7 +35,7 @@ body:
         - OS: Ubuntu 24.04
         - Docker: 27.x
         - Hermes: v0.15.1
-        - Embedding: OpenRouter / Ollama
+        - Embedding: OpenRouter (or any OpenAI-compatible remote endpoint)
   - type: textarea
     id: logs
     attributes:

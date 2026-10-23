@@ -1,6 +1,7 @@
 """Tool handlers — the code that runs when the LLM calls each tool."""
 
 import json
+from . import evolution
 from . import state
 
 
@@ -34,20 +35,45 @@ def fabric_write(args: dict, **kwargs) -> str:
     revises = args.get("revises", "").strip()
     if not entry_type or not content or not summary:
         return _json({"error": "Need type, content, and summary"})
+    # entry_type becomes part of the output filename — reject traversal
+    # attempts here too (state.write_entry validates as well; this gives the
+    # caller an actionable error instead of a raised exception).
+    if not state.is_valid_entry_type(entry_type):
+        return _json(
+            {
+                "error": f"invalid type '{entry_type}': must match "
+                f"{state._ENTRY_TYPE_RE.pattern} (lowercase letters, digits, "
+                "'_' and '-')"
+            }
+        )
     if status == "open" and not assigned_to:
         return _json({"error": "status='open' requires assigned_to"})
     if entry_type == "review" and not review_of:
-        return _json({"error": "type='review' requires review_of (agent:id of the entry you are reviewing)"})
+        return _json(
+            {
+                "error": "type='review' requires review_of (agent:id of the entry you are reviewing)"
+            }
+        )
     if review_of:
         parts = review_of.split(":", 1)
         if len(parts) != 2 or not parts[0] or not parts[1] or len(parts[1]) < 4:
-            return _json({"error": f"review_of must be agent:id (e.g. icarus:a3f29b01), got '{review_of}'"})
+            return _json(
+                {
+                    "error": f"review_of must be agent:id (e.g. icarus:a3f29b01), got '{review_of}'"
+                }
+            )
         if not state.has_entry_ref(review_of):
-            return _json({"error": f"review_of points to a missing entry: '{review_of}'"})
+            return _json(
+                {"error": f"review_of points to a missing entry: '{review_of}'"}
+            )
     if revises:
         parts = revises.split(":", 1)
         if len(parts) != 2 or not parts[0] or not parts[1] or len(parts[1]) < 4:
-            return _json({"error": f"revises must be agent:id (e.g. icarus:a3f29b01), got '{revises}'"})
+            return _json(
+                {
+                    "error": f"revises must be agent:id (e.g. icarus:a3f29b01), got '{revises}'"
+                }
+            )
         if not state.has_entry_ref(revises):
             return _json({"error": f"revises points to a missing entry: '{revises}'"})
     tv = args.get("training_value", "").strip()
@@ -101,12 +127,14 @@ def fabric_pending(args: dict, **kwargs) -> str:
         open_tasks, reviews, open_tickets = state.read_pending(
             customer_id=args.get("customer_id"),
         )
-        return _json({
-            "open_tasks": open_tasks,
-            "reviews_of_my_work": reviews,
-            "open_tickets": open_tickets,
-            "total": len(open_tasks) + len(reviews) + len(open_tickets),
-        })
+        return _json(
+            {
+                "open_tasks": open_tasks,
+                "reviews_of_my_work": reviews,
+                "open_tickets": open_tickets,
+                "total": len(open_tasks) + len(reviews) + len(open_tickets),
+            }
+        )
     except Exception as e:
         return _json({"error": str(e)})
 
@@ -222,6 +250,7 @@ def fabric_telemetry(args: dict, **kwargs) -> str:
 def fabric_init_obsidian(args: dict, **kwargs) -> str:
     try:
         from . import obsidian
+
         result = obsidian.init_obsidian(state.FABRIC_DIR)
         return _json(result)
     except Exception as e:
@@ -232,5 +261,43 @@ def fabric_report(args: dict, **kwargs) -> str:
     try:
         result = state.build_weekly_report()
         return _json(result)
+    except Exception as e:
+        return _json({"error": str(e)})
+
+
+# ── Self-evolution (fact store) ───────────────────────────
+
+
+def fact_feedback(args: dict, **kwargs) -> str:
+    """Record whether a durable fact proved helpful (trust nudge).
+
+    Thin forwarder to ``evolution.apply_feedback`` so the agent can correct the
+    fact store's trust model explicitly, in addition to the automatic
+    keyword-overlap feedback applied in post_llm_call.
+    """
+    raw_id = args.get("fact_id", args.get("id"))
+    try:
+        fact_id = int(raw_id)
+    except (TypeError, ValueError):
+        return _json({"error": f"fact_id must be an integer, got {raw_id!r}"})
+    raw_helpful = args.get("helpful", True)
+    if isinstance(raw_helpful, str):
+        helpful = raw_helpful.strip().lower() not in ("0", "false", "no", "off", "")
+    else:
+        helpful = bool(raw_helpful)
+    try:
+        return _json(evolution.apply_feedback(fact_id, helpful=helpful))
+    except Exception as e:
+        return _json({"error": str(e)})
+
+
+def memory_evolution_stats(args: dict, **kwargs) -> str:
+    """Report fact-store size, average trust and the most-used facts."""
+    try:
+        top_n = int(args.get("top_n", evolution.TOP_USED_DEFAULT))
+    except (TypeError, ValueError):
+        top_n = evolution.TOP_USED_DEFAULT
+    try:
+        return _json(evolution.stats(top_n=top_n))
     except Exception as e:
         return _json({"error": str(e)})

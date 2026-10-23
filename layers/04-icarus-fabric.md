@@ -80,7 +80,7 @@ OPENROUTER_API_KEY=sk-or-...
 
 # Strongly recommended
 ICARUS_EXTRACTION_MAX_TOKENS=4096
-ICARUS_EXTRACTION_MODEL=deepseek/deepseek-v4-flash
+ICARUS_EXTRACTION_MODEL=deepseek/deepseek-chat
 
 # Optional (for Obsidian integration)
 ICARUS_OBSIDIAN=1

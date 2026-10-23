@@ -60,7 +60,7 @@ They're independent: the Wiki Agent builds the curated knowledge graph; Continuo
    a. process_wiki_file → reads file content
    b. parse_frontmatter → extracts metadata
    c. get_embedding() → Qwen3-Embedding-8B (4096d)
-   d. get_sparse_embedding() → BM25 (fastembed, local)
+   d. get_sparse_embedding() → BM25 tf (pure Python) → Qdrant applies IDF
    e. upsert_with_dedup() → Qdrant knowledge_base
 ```
 

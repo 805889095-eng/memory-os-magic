@@ -18,8 +18,9 @@
 #   5. Installs the Icarus plugin
 #   6. Creates wiki/vault directory structure
 #   7. Starts Redis + Qdrant + Worker (Docker Compose)
-#   8. Configures environment variables
-#   9. Applies rulebook modifications
+#   8. Installs the 6-job maintenance scheduler (crontab; skipped on Windows)
+#   9. Configures environment variables
+#  10. Applies rulebook modifications
 #
 # Idempotent — safe to run multiple times.
 # ──────────────────────────────────────────────────────────────────────────────
@@ -259,8 +260,8 @@ info "Downloading pre-built images (Redis, Qdrant)..."
 docker compose pull redis qdrant 2>&1 | tail -3
 ok "Base images downloaded"
 
-# Build worker image — SLOW on first run (gcc + build-essential)
-info "Building worker image (may take 5-10 minutes on first run)..."
+# Build worker image — SLOW on first run
+info "Building worker image (may take a few minutes on first run)..."
 info "  (Future builds will use Docker cache)"
 if docker compose build worker 2>&1; then
     ok "Worker image built"
@@ -291,18 +292,67 @@ fi
 cd "${REPO_DIR}"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Phase 7b: Wiki Watcher Cron
+# Phase 7b: Maintenance Scheduler (crontab)
 # ──────────────────────────────────────────────────────────────────────────────
-banner "Phase 7b: Wiki Watcher"
+banner "Phase 7b: Maintenance Scheduler"
 
-CRON_ENTRY="0 * * * * cd ${REPO_DIR} && python3 scripts/wiki_continuous_ingest.py >> ${HERMES_HOME}/logs/wiki-ingest.log 2>&1"
-CRON_MARKER="# memory-os wiki watcher"
-
-if crontab -l 2>/dev/null | grep -qF "${CRON_MARKER}"; then
-    ok "Wiki watcher cron already installed"
+# All paths derive from HERMES_HOME / the repo root — never hardcode user paths.
+if [ -f "${SCRIPT_DIR}/scripts/wiki_continuous_ingest.py" ]; then
+    REPO_ROOT="${SCRIPT_DIR}"
 else
-    (crontab -l 2>/dev/null; echo "${CRON_MARKER}"; echo "${CRON_ENTRY}") | crontab -
-    ok "Wiki watcher cron installed (hourly ingestion)"
+    REPO_ROOT="${REPO_DIR}"
+fi
+CRON_BEGIN="# >>> memory-os scheduler >>>"
+CRON_END="# <<< memory-os scheduler <<<"
+CRON_LOG_DIR="${HERMES_HOME}/logs"
+mkdir -p "${CRON_LOG_DIR}" 2>/dev/null || true
+
+# The six maintenance jobs: schedule | python script | log file | purpose.
+CRON_WIKI="0 * * * * cd ${REPO_ROOT} && HERMES_HOME=${HERMES_HOME} python3 scripts/wiki_continuous_ingest.py >> ${CRON_LOG_DIR}/wiki-ingest.log 2>&1"
+CRON_REFLECT="*/5 * * * * cd ${REPO_ROOT} && HERMES_HOME=${HERMES_HOME} python3 scripts/reflection_trigger.py >> ${CRON_LOG_DIR}/reflection_trigger.log 2>&1"
+CRON_DECAY="0 3 * * 0 cd ${REPO_ROOT} && HERMES_HOME=${HERMES_HOME} python3 scripts/decay_scanner.py >> ${CRON_LOG_DIR}/decay_scanner.log 2>&1"
+CRON_DEDUP="0 3 1 * * cd ${REPO_ROOT} && HERMES_HOME=${HERMES_HOME} python3 scripts/semantic_dedup.py >> ${CRON_LOG_DIR}/semantic_dedup.log 2>&1"
+CRON_DLQ="0 */2 * * * cd ${REPO_ROOT} && HERMES_HOME=${HERMES_HOME} python3 scripts/dlq_manager.py --report >> ${CRON_LOG_DIR}/dlq_manager.log 2>&1"
+# Trust-score decay for the facts store (the self-evolution loop's forgetting half).
+# Runs daily at 03:30 so it never collides with the 03:00 weekly/monthly scanners.
+CRON_FACTDECAY="30 3 * * * cd ${REPO_ROOT} && HERMES_HOME=${HERMES_HOME} python3 icarus/evolution.py --decay 30 >> ${CRON_LOG_DIR}/fact_decay.log 2>&1"
+
+info "Installing 6 maintenance cron jobs:"
+info "  hourly             -> scripts/wiki_continuous_ingest.py   (wiki incremental ingestion)"
+info "  every 5 minutes    -> scripts/reflection_trigger.py       (idle micro-reflection trigger)"
+info "  weekly (Sun 03:00) -> scripts/decay_scanner.py            (Qdrant decay + archival)"
+info "  monthly (1st 03:00)-> scripts/semantic_dedup.py           (near-duplicate scan)"
+info "  every 2 hours      -> scripts/dlq_manager.py --report     (dead-letter queue report)"
+info "  daily (03:30)      -> icarus/evolution.py --decay 30      (facts trust-score decay)"
+
+if ! command -v crontab >/dev/null 2>&1; then
+    warn "crontab not available on this platform (e.g. Windows / git-bash) — skipping scheduler installation"
+    info "The stack still works; schedule the 6 scripts above with your OS scheduler if needed."
+else
+    EXISTING_CRON="$(crontab -l 2>/dev/null || true)"
+
+    # Idempotency: drop any previous managed block, then append the fresh one.
+    CLEANED_CRON="$(printf '%s\n' "${EXISTING_CRON}" | awk -v b="${CRON_BEGIN}" -v e="${CRON_END}" '
+        $0 == b { skip = 1; next }
+        $0 == e { skip = 0; next }
+        !skip   { print }
+    ')"
+
+    if {
+        printf '%s\n' "${CLEANED_CRON}"
+        printf '%s\n' "${CRON_BEGIN}"
+        printf '%s\n' "${CRON_WIKI}"
+        printf '%s\n' "${CRON_REFLECT}"
+        printf '%s\n' "${CRON_DECAY}"
+        printf '%s\n' "${CRON_DEDUP}"
+        printf '%s\n' "${CRON_DLQ}"
+        printf '%s\n' "${CRON_FACTDECAY}"
+        printf '%s\n' "${CRON_END}"
+    } | crontab -; then
+        ok "Maintenance scheduler installed (6 cron jobs, idempotent managed block)"
+    else
+        warn "crontab update failed — schedule the 6 scripts manually"
+    fi
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -327,11 +377,16 @@ add_env() {
 
 add_env "FABRIC_DIR" "${VAULT_PATH}/fabric"
 add_env "ICARUS_EXTRACTION_MAX_TOKENS" "4096"
-add_env "ICARUS_EXTRACTION_MODEL" "deepseek/deepseek-v4-flash"
+add_env "ICARUS_EXTRACTION_MODEL" "deepseek/deepseek-chat"
 add_env "EMBEDDING_API_BASE" "https://openrouter.ai/api/v1"
 add_env "EMBEDDING_MODEL" "qwen/qwen3-embedding-8b"
 add_env "EMBEDDING_API_KEY" ""
 add_env "EMBEDDING_DIMS" "4096"
+add_env "LLM_API_BASE" "https://openrouter.ai/api/v1"
+add_env "LLM_MODEL" "deepseek/deepseek-chat"
+add_env "LLM_API_KEY" ""
+add_env "ARQ_MAX_TRIES" "3"
+add_env "HERMES_DLQ_PATH" "${HERMES_HOME}/wiki_ingest_failures.json"
 add_env "HERMES_AGENT_NAME" "hermes"
 add_env "REDIS_PASSWORD" "${REDIS_PW}"
 add_env "OPENROUTER_API_KEY" "${OPENROUTER_KEY}"

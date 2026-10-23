@@ -2,11 +2,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system dependencies (build-essential for fastembed, python3-dev for C extensions)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    python3-dev \
-    && rm -rf /var/lib/apt/lists/*
+# No system build tooling is needed: every dependency here ships prebuilt wheels.
 
 # Copy and install Python dependencies
 COPY requirements.txt .

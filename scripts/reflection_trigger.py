@@ -12,7 +12,7 @@ Regras:
 - Nunca bloqueia o path crítico de query/ingestão
 
 Uso (cron):
-  */5 * * * * /home/calli/ai-stack/cognitive-agent/venv/bin/python /home/calli/ai-stack/scripts/reflection_trigger.py >> /home/calli/.hermes/logs/reflection_trigger.cron.log 2>&1
+  */5 * * * * $HERMES_HOME/venv/bin/python /path/to/memory-os/scripts/reflection_trigger.py >> $HERMES_HOME/logs/reflection_trigger.cron.log 2>&1
 """
 
 import os
@@ -29,7 +29,13 @@ from arq.connections import RedisSettings
 import redis.asyncio as aioredis
 
 # ─── Config ────────────────────────────────────────────────────────────────
-ENV_PATH = Path.home() / "ai-stack" / "cognitive-agent" / ".env"
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+# MAA_ENV_PATH takes precedence; the default keeps the legacy path for compat.
+ENV_PATH = Path(
+    os.environ.get(
+        "MAA_ENV_PATH", str(Path.home() / "ai-stack" / "cognitive-agent" / ".env")
+    )
+)
 if ENV_PATH.exists():
     load_dotenv(ENV_PATH)
 
@@ -44,7 +50,18 @@ redis_settings = RedisSettings(
     password=REDIS_PASSWORD or None,
 )
 
-LOG_FILE = Path.home() / ".hermes" / "logs" / "reflection_trigger.log"
+LOG_FILE = HERMES_HOME / "logs" / "reflection_trigger.log"
+
+
+def resolve_state_db() -> Path:
+    """Resolve the state DB path.
+
+    Order: STATE_DB_PATH → HERMES_HOME/state.db → ~/.hermes/state.db.
+    """
+    env = os.environ.get("STATE_DB_PATH")
+    if env:
+        return Path(env)
+    return HERMES_HOME / "state.db"
 
 
 def log_message(msg: str):
@@ -63,7 +80,8 @@ async def is_idle() -> bool:
     """Verifica se não há jobs pendentes nem em execução no ARQ."""
     try:
         r = aioredis.Redis(
-            host=REDIS_HOST, port=REDIS_PORT,
+            host=REDIS_HOST,
+            port=REDIS_PORT,
             password=REDIS_PASSWORD or None,
             decode_responses=True,
         )
@@ -105,11 +123,14 @@ async def check_budget() -> tuple[bool, int, int]:
     """Retorna (permitido, used, max) baseado no contador da hora no SQLite."""
     try:
         import sqlite3
-        db_path = Path.home() / ".hermes" / "state.db"
+
+        db_path = resolve_state_db()
         hour_window = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
         conn = sqlite3.connect(str(db_path))
         c = conn.cursor()
-        c.execute("SELECT count FROM reflection_budget WHERE hour_window = ?", (hour_window,))
+        c.execute(
+            "SELECT count FROM reflection_budget WHERE hour_window = ?", (hour_window,)
+        )
         row = c.fetchone()
         used = row[0] if row else 0
         conn.close()
@@ -123,16 +144,20 @@ def increment_budget():
     """Incrementa o contador de reflections no SQLite."""
     try:
         import sqlite3
-        db_path = Path.home() / ".hermes" / "state.db"
+
+        db_path = resolve_state_db()
         hour_window = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
         conn = sqlite3.connect(str(db_path))
         c = conn.cursor()
-        c.execute("""
+        c.execute(
+            """
             INSERT INTO reflection_budget (hour_window, count, tokens_used)
             VALUES (?, 1, 0)
             ON CONFLICT(hour_window)
             DO UPDATE SET count = count + 1
-        """, (hour_window,))
+        """,
+            (hour_window,),
+        )
         conn.commit()
         conn.close()
     except Exception as e:

@@ -19,19 +19,71 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+HERMES_HOME = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
 FABRIC_DIR = Path(os.environ.get("FABRIC_DIR", Path.home() / "fabric"))
-STATE_DB = Path(os.environ.get("STATE_DB_PATH", Path.home() / ".hermes" / "state.db"))
+# Default DB path follows HERMES_HOME so multi-profile installs don't read a
+# stale ~/.hermes/state.db. STATE_DB_PATH still overrides for back-compat.
+STATE_DB = Path(os.environ.get("STATE_DB_PATH") or (HERMES_HOME / "state.db"))
 
 # ── SQLite fabric index (avoids glob+parse on every retrieval) ──────────
+
+
+def _entry_title(e) -> str:
+    """Best-effort display title for an indexed entry.
+
+    parsing.parse_entry() only surfaces a ``title`` when the YAML frontmatter
+    actually has one, so the column was frequently empty. Fall back to
+    ``summary``/``subject`` and finally to the first meaningful body line so
+    the title is never blank.
+    """
+    for key in ("title", "summary", "subject"):
+        val = e.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()[:200]
+    body = e.get("_body") or e.get("body") or ""
+    for line in str(body).splitlines():
+        line = line.strip().lstrip("#").strip()
+        if line:
+            return line[:200]
+    return ""
+
+
+def _reconstruct_full(e) -> str:
+    """Rebuild a readable full-text view for an indexed entry.
+
+    fabric_index does not persist parsing.parse_entry()'s ``_full`` (the raw
+    file text), so the old ``e.get("_full", "")`` was always empty — which made
+    the token budget a no-op and rendered blank results. Reconstruct an
+    equivalent view from the columns that *are* stored.
+    """
+    parts = []
+    title = _entry_title(e)
+    if title:
+        meta = " | ".join(
+            str(x) for x in (e.get("agent"), e.get("type"), e.get("timestamp")) if x
+        )
+        parts.append(f"# {title}" + (f" ({meta})" if meta else ""))
+    body = e.get("_body") or e.get("body") or ""
+    if str(body).strip():
+        parts.append(str(body).strip())
+    return "\n\n".join(parts).strip()
+
 
 def _ensure_fabric_index(fabric_dir: Path) -> sqlite3.Connection:
     """Return a connection to state.db with a fresh fabric_index table.
 
-    Creates fabric_index + fabric_fts (FTS5) if they don't exist.
+    Creates fabric_index if it doesn't exist. The legacy ``fabric_fts`` FTS5
+    table was never populated or queried (no INSERT/MATCH existed anywhere in
+    the tree), so it is dropped here and its dead code removed; ranking is done
+    entirely by the Python scorer in retrieve().
     Rebuilds the index when any fabric .md file has an mtime newer than
     the latest stored mtime. Uses a transaction so a partial rebuild
     won't leave the index inconsistent.
     """
+    try:
+        STATE_DB.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
     conn = sqlite3.connect(str(STATE_DB))
     conn.row_factory = sqlite3.Row
 
@@ -52,8 +104,7 @@ def _ensure_fabric_index(fabric_dir: Path) -> sqlite3.Connection:
             mtime      REAL NOT NULL,
             file_path  TEXT NOT NULL
         );
-        CREATE VIRTUAL TABLE IF NOT EXISTS fabric_fts
-            USING fts5(title, body, content=fabric_index, content_rowid=rowid);
+        DROP TABLE IF EXISTS fabric_fts;
     """)
     conn.commit()
 
@@ -78,7 +129,6 @@ def _ensure_fabric_index(fabric_dir: Path) -> sqlite3.Connection:
     # Rebuild in a transaction
     conn.execute("BEGIN")
     conn.execute("DELETE FROM fabric_index")
-    conn.execute("DELETE FROM fabric_fts")
     for d in (fabric_dir, fabric_dir / "cold"):
         try:
             for f in d.glob("*.md"):
@@ -87,28 +137,33 @@ def _ensure_fabric_index(fabric_dir: Path) -> sqlite3.Connection:
                     continue
                 rel_path = str(f.relative_to(fabric_dir))
                 mtime = f.stat().st_mtime
-                conn.execute("""
+                conn.execute(
+                    """
                     INSERT OR REPLACE INTO fabric_index
                     (entry_id, agent, type, title, body, timestamp,
                      tags, project, tier, status, assigned_to, refs,
                      mtime, file_path)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    f"{e.get('agent','')}:{e.get('id','')}",
-                    e.get("agent", ""),
-                    e.get("type", ""),
-                    e.get("title", ""),
-                    e.get("_body", ""),
-                    e.get("timestamp", ""),
-                    e.get("tags", ""),
-                    e.get("project_id", e.get("project", "")),
-                    e.get("tier", ""),
-                    e.get("status", ""),
-                    e.get("assigned_to", ""),
-                    e.get("refs", ""),
-                    mtime,
-                    rel_path,
-                ))
+                """,
+                    (
+                        f"{e.get('agent', '')}:{e.get('id', '')}",
+                        e.get("agent", ""),
+                        e.get("type", ""),
+                        _entry_title(e),
+                        e.get("_body", ""),
+                        e.get("timestamp", ""),
+                        # Frontmatter tags/refs are commonly YAML lists; a list
+                        # cannot be bound to a TEXT column, so normalise first.
+                        _as_text(e.get("tags", "")),
+                        _as_text(e.get("project_id", e.get("project", ""))),
+                        e.get("tier", ""),
+                        e.get("status", ""),
+                        _as_text(e.get("assigned_to", "")),
+                        _as_text(e.get("refs", "")),
+                        mtime,
+                        rel_path,
+                    ),
+                )
         except OSError:
             pass
     conn.commit()
@@ -121,35 +176,141 @@ try:
 except ImportError:
     from parsing import parse_entry, _strip_generated_obsidian_sections
 
-STOP_WORDS = {"the", "a", "an", "is", "was", "are", "were", "be", "been", "being",
-              "have", "has", "had", "do", "does", "did", "will", "would", "could",
-              "should", "may", "might", "shall", "can", "to", "of", "in", "for",
-              "on", "with", "at", "by", "from", "as", "into", "through", "during",
-              "it", "its", "this", "that", "and", "or", "but", "not", "no", "if",
-              "then", "than", "so", "up", "out", "about", "what", "which", "who",
-              "how", "when", "where", "why", "i", "me", "my", "we", "our", "you"}
+STOP_WORDS = {
+    "the",
+    "a",
+    "an",
+    "is",
+    "was",
+    "are",
+    "were",
+    "be",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "do",
+    "does",
+    "did",
+    "will",
+    "would",
+    "could",
+    "should",
+    "may",
+    "might",
+    "shall",
+    "can",
+    "to",
+    "of",
+    "in",
+    "for",
+    "on",
+    "with",
+    "at",
+    "by",
+    "from",
+    "as",
+    "into",
+    "through",
+    "during",
+    "it",
+    "its",
+    "this",
+    "that",
+    "and",
+    "or",
+    "but",
+    "not",
+    "no",
+    "if",
+    "then",
+    "than",
+    "so",
+    "up",
+    "out",
+    "about",
+    "what",
+    "which",
+    "who",
+    "how",
+    "when",
+    "where",
+    "why",
+    "i",
+    "me",
+    "my",
+    "we",
+    "our",
+    "you",
+}
 
-CODE_WORDS = {"function", "bug", "error", "build", "deploy", "test", "code", "fix",
-              "commit", "merge", "api", "endpoint", "module", "class", "method",
-              "refactor", "debug", "compile", "runtime", "exception", "stack"}
+CODE_WORDS = {
+    "function",
+    "bug",
+    "error",
+    "build",
+    "deploy",
+    "test",
+    "code",
+    "fix",
+    "commit",
+    "merge",
+    "api",
+    "endpoint",
+    "module",
+    "class",
+    "method",
+    "refactor",
+    "debug",
+    "compile",
+    "runtime",
+    "exception",
+    "stack",
+}
 
-CUSTOMER_WORDS = {"customer", "billing", "support", "ticket", "refund", "account",
-                  "subscription", "payment", "invoice", "complaint", "resolution",
-                  "escalation", "onboarding", "churn", "retention"}
+CUSTOMER_WORDS = {
+    "customer",
+    "billing",
+    "support",
+    "ticket",
+    "refund",
+    "account",
+    "subscription",
+    "payment",
+    "invoice",
+    "complaint",
+    "resolution",
+    "escalation",
+    "onboarding",
+    "churn",
+    "retention",
+}
 
-HANDOFF_WORDS = {"handoff", "review", "reviewer", "pickup", "pending", "relay",
-                 "assigned", "assignee", "revise", "revision", "feedback"}
+HANDOFF_WORDS = {
+    "handoff",
+    "review",
+    "reviewer",
+    "pickup",
+    "pending",
+    "relay",
+    "assigned",
+    "assignee",
+    "revise",
+    "revision",
+    "feedback",
+}
 
 
 def tokenize(text):
-    words = set(re.findall(r'[a-z0-9]+', text.lower()))
+    words = set(re.findall(r"[a-z0-9]+", text.lower()))
     return words - STOP_WORDS
 
 
 def _ngrams(tokens, n):
     if len(tokens) < n:
         return set()
-    return {tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1)}
+    return {tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1)}
 
 
 def age_hours(timestamp_str):
@@ -163,11 +324,28 @@ def age_hours(timestamp_str):
         return 9999
 
 
+def _as_text(value):
+    """Coerce a frontmatter value (list/tuple/set/scalar) into a TEXT column.
+
+    Obsidian frontmatter commonly stores ``tags``/``refs`` as YAML lists; the
+    sqlite driver cannot bind a list, which previously made the index rebuild
+    crash with "Error binding parameter ... type 'list' is not supported".
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        return ",".join(str(v) for v in value if v is not None)
+    return str(value)
+
+
 def _as_list(value):
     if not value:
         return []
-    if isinstance(value, list):
-        return value
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    if isinstance(value, str):
+        # Values round-tripped through a TEXT column are comma-joined.
+        return [p.strip() for p in value.split(",") if p.strip()]
     return [value]
 
 
@@ -209,7 +387,7 @@ def score_entry(entry, query_tokens, agent=None, project=None, relevant_refs=Non
     entry_tags = _as_list(entry.get("tags", []))
     tag_tokens = set()
     for t in entry_tags:
-        tag_tokens.update(re.findall(r'[a-z0-9]+', str(t).lower()))
+        tag_tokens.update(re.findall(r"[a-z0-9]+", str(t).lower()))
     tag_hits = len(query_tokens & tag_tokens)
     score += tag_hits * 4
 
@@ -220,9 +398,9 @@ def score_entry(entry, query_tokens, agent=None, project=None, relevant_refs=Non
         if project_lower == str(entry_project).lower():
             score += 10  # exact project_id match
         elif project_lower in body:
-            score += 8   # project name in body text
+            score += 8  # project name in body text
         elif any(project_lower in str(t).lower() for t in entry_tags):
-            score += 8   # project name in tags
+            score += 8  # project name in tags
 
     # 3. Same agent
     if agent and entry.get("agent") == agent:
@@ -276,7 +454,18 @@ def score_entry(entry, query_tokens, agent=None, project=None, relevant_refs=Non
     # Reviews reference the original work's keywords, which inflates their
     # keyword score. When the query isn't asking for reviews/feedback, penalize
     # type=review so the source entry ranks higher.
-    REVIEW_QUERY_WORDS = {"review", "reviewed", "feedback", "issue", "fix", "must", "should", "approve", "reject", "lgtm"}
+    REVIEW_QUERY_WORDS = {
+        "review",
+        "reviewed",
+        "feedback",
+        "issue",
+        "fix",
+        "must",
+        "should",
+        "approve",
+        "reject",
+        "lgtm",
+    }
     if entry_type == "review":
         if query_tokens & REVIEW_QUERY_WORDS:
             # query IS about reviews — boost linking fields
@@ -303,7 +492,9 @@ def score_entry(entry, query_tokens, agent=None, project=None, relevant_refs=Non
         for ref_str in relevant_refs:
             if ":" in ref_str:
                 ref_agent, ref_id = ref_str.split(":", 1)
-                if ref_agent == entry_agent and (ref_id == entry_id or ref_id == entry_cycle):
+                if ref_agent == entry_agent and (
+                    ref_id == entry_id or ref_id == entry_cycle
+                ):
                     score += 3
         linked_refs = [entry.get("review_of"), entry.get("revises")]
         for ref in linked_refs:
@@ -355,6 +546,11 @@ def retrieve(query, max_results=5, max_tokens=2000, agent=None, project=None):
         e = dict(row)
         e["_body"] = e.pop("body", "")
         e["_file"] = e.get("file_path", "")
+        # fabric_index has no ``summary`` column and parse_entry() does not
+        # always yield a frontmatter title — derive one so score_entry()'s
+        # summary signal and the rendered output are never blank.
+        e["title"] = _entry_title(e)
+        e["summary"] = e["title"]
         eid_parts = (e.get("entry_id") or ":").split(":", 1)
         e["id"] = eid_parts[1] if len(eid_parts) > 1 else ""
         entries.append(e)
@@ -376,9 +572,7 @@ def retrieve(query, max_results=5, max_tokens=2000, agent=None, project=None):
     top_refs = set()
     for score, e in scored[:10]:
         if score > 0:
-            refs = e.get("refs", [])
-            if isinstance(refs, str):
-                refs = [refs]
+            refs = _as_list(e.get("refs", []))
             top_refs.update(refs)
             eid = e.get("id", "")
             eagent = e.get("agent", "")
@@ -387,7 +581,9 @@ def retrieve(query, max_results=5, max_tokens=2000, agent=None, project=None):
 
     # Second pass: rescore with ref chain
     if top_refs:
-        scored = [(score_entry(e, query_tokens, agent, project, top_refs), e) for e in entries]
+        scored = [
+            (score_entry(e, query_tokens, agent, project, top_refs), e) for e in entries
+        ]
         scored.sort(key=lambda x: x[0], reverse=True)
 
     # Filter zero scores
@@ -410,11 +606,14 @@ def retrieve(query, max_results=5, max_tokens=2000, agent=None, project=None):
     # Apply max_results
     final = final[:max_results]
 
-    # Apply token budget (always enforced, including first entry)
+    # Apply token budget (always enforced, including first entry).
+    # NOTE: fabric_index has no ``_full`` column, so the old
+    # ``e.get("_full", "")`` always yielded "" and this budget never filtered
+    # anything. Measure the reconstructed content that is actually emitted.
     budget = max_tokens
     result = []
     for score, e in final:
-        content = e.get("_full", "")
+        content = _reconstruct_full(e)
         tokens = len(content) // 4
         if tokens > budget:
             continue  # skip oversized entries, try next
@@ -427,8 +626,10 @@ def retrieve(query, max_results=5, max_tokens=2000, agent=None, project=None):
 def format_results(results):
     lines = []
     for score, e in results:
-        lines.append(f"# relevance: {score:.0f} | {e.get('agent','')} | {e.get('platform','')} | {e.get('type','')}")
-        lines.append(e.get("_full", "").strip())
+        lines.append(
+            f"# relevance: {score:.0f} | {e.get('agent', '')} | {e.get('platform', '')} | {e.get('type', '')}"
+        )
+        lines.append(_reconstruct_full(e))
         lines.append("---")
     return "\n".join(lines)
 
@@ -436,10 +637,16 @@ def format_results(results):
 def main():
     parser = argparse.ArgumentParser(description="Smart fabric retrieval")
     parser.add_argument("query", help="Search query or current task description")
-    parser.add_argument("--max-results", type=int, default=5, help="Maximum entries to return")
-    parser.add_argument("--max-tokens", type=int, default=2000, help="Token budget (chars/4)")
+    parser.add_argument(
+        "--max-results", type=int, default=5, help="Maximum entries to return"
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=2000, help="Token budget (chars/4)"
+    )
     parser.add_argument("--agent", default=None, help="Boost entries from this agent")
-    parser.add_argument("--project", default=None, help="Boost entries from this project")
+    parser.add_argument(
+        "--project", default=None, help="Boost entries from this project"
+    )
     parser.add_argument("--fabric-dir", default=None, help="Override fabric directory")
     args = parser.parse_args()
 
@@ -447,7 +654,9 @@ def main():
     if args.fabric_dir:
         FABRIC_DIR = Path(args.fabric_dir)
 
-    results = retrieve(args.query, args.max_results, args.max_tokens, args.agent, args.project)
+    results = retrieve(
+        args.query, args.max_results, args.max_tokens, args.agent, args.project
+    )
 
     if not results:
         print("no relevant entries found")

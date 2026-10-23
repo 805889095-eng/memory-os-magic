@@ -418,3 +418,48 @@ FABRIC_REPORT = {
         "required": [],
     },
 }
+
+FACT_FEEDBACK = {
+    "name": "fact_feedback",
+    "description": (
+        "Record whether a durable fact proved helpful, nudging its trust score "
+        "(helpful raises trust and increments helpful_count; unhelpful lowers "
+        "trust). Fact ids come from memory_evolution_stats. Automatic "
+        "keyword-overlap feedback already runs each turn — use this tool to "
+        "correct it explicitly."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "fact_id": {
+                "type": "integer",
+                "description": "Id of the fact to score (from memory_evolution_stats)",
+            },
+            "helpful": {
+                "type": "boolean",
+                "description": "True if the fact proved useful (default: true)",
+            },
+        },
+        "required": ["fact_id"],
+    },
+}
+
+MEMORY_EVOLUTION_STATS = {
+    "name": "memory_evolution_stats",
+    "description": (
+        "Self-evolution snapshot of the durable fact store: total facts, "
+        "average trust score, facts that have proven helpful, total retrievals, "
+        "and the most-used facts with their trust/usage/rank scores. Use this "
+        "to see what the memory has learned and which facts keep paying off."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "top_n": {
+                "type": "integer",
+                "description": "How many most-used facts to return (default: 10)",
+            },
+        },
+        "required": [],
+    },
+}

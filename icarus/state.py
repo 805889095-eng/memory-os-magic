@@ -16,12 +16,17 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-FABRIC_DIR = Path(os.environ.get("FABRIC_DIR", Path.home() / "fabric"))
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", "")) if os.environ.get("HERMES_HOME") else None
+# HERMES_HOME is ALWAYS resolved. It used to be ``None`` when the env var was
+# unset, which silently produced multi-profile misrouting (e.g. state.db under
+# ~/.hermes while the plugin lived under <home>/plugins) and made the
+# ``if not HERMES_HOME: return`` guard in write_memory_file skip writing
+# entirely. Falling back to ~/.hermes matches setup_db.py's default.
+HERMES_HOME = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+FABRIC_DIR = Path(os.environ.get("FABRIC_DIR", HERMES_HOME / "fabric"))
 AGENT_NAME = os.environ.get("HERMES_AGENT_NAME", "")
 PLUGIN_DIR = Path(__file__).parent
 
-if not AGENT_NAME and HERMES_HOME and ".hermes-" in str(HERMES_HOME):
+if not AGENT_NAME and ".hermes-" in str(HERMES_HOME):
     AGENT_NAME = str(HERMES_HOME).split(".hermes-")[-1].rstrip("/")
 
 # ── Shared regexes (used by hooks.py and scoring) ────────
@@ -35,7 +40,84 @@ COMPLETION_RE = re.compile(
     r"(?i)\b(completed|finished|done|shipped|deployed|resolved|closed|merged|fixed)\b"
 )
 
-# ── Session state ────────────────────────────────────────
+# ── Entry-type whitelist ─────────────────────────────────
+# ``entry_type`` goes verbatim into the output filename
+# (``{agent}-{entry_type}-{slug}-{suffix}.md``). An untrusted value such as
+# ``../../evil`` therefore escaped FABRIC_DIR — a path-traversal write. Only a
+# strict slug is accepted; invalid values are rejected loudly, never sanitised
+# into something silently different from what the caller asked for.
+_ENTRY_TYPE_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
+
+
+def is_valid_entry_type(entry_type) -> bool:
+    """True when ``entry_type`` is a safe filename slug."""
+    return bool(_ENTRY_TYPE_RE.match(str(entry_type or "").strip()))
+
+
+def _safe_entry_type(entry_type) -> str:
+    """Return the validated entry type, or raise ``ValueError``."""
+    value = str(entry_type or "").strip()
+    if not _ENTRY_TYPE_RE.match(value):
+        raise ValueError(
+            f"invalid entry_type {entry_type!r}: must match {_ENTRY_TYPE_RE.pattern}"
+        )
+    return value
+
+
+# ── Session state (session-isolated) ─────────────────────
+# These were process-wide singletons, so two sessions sharing one Hermes
+# process shared a single ``exchanges`` list and ``session_id``: a concurrent
+# session's turns were attributed to whichever session started last.
+# ``bind_session`` rebinds the three module-level names below to the record for
+# the active session, so every existing call site
+# (``state.exchanges.append(...)``, ``state.session_id``, ``state._recall_log``)
+# keeps working unchanged — only the backing storage moved.
+_SESSION_CACHE: dict = {}
+_SESSION_CACHE_MAX = 64
+_DEFAULT_SESSION_KEY = "__no_session__"
+
+
+class _SessionRecord:
+    __slots__ = ("session_id", "exchanges", "recall_log")
+
+    def __init__(self, session_id=""):
+        self.session_id = session_id
+        self.exchanges = []
+        self.recall_log = []
+
+
+def _session_record(session_id=""):
+    """Return the record for ``session_id``, LRU-refreshed, capped."""
+    key = session_id or _DEFAULT_SESSION_KEY
+    rec = _SESSION_CACHE.pop(key, None)
+    if rec is None:
+        rec = _SessionRecord(session_id)
+    _SESSION_CACHE[key] = rec
+    while len(_SESSION_CACHE) > _SESSION_CACHE_MAX:
+        oldest = next(iter(_SESSION_CACHE))
+        if oldest == key:
+            break
+        _SESSION_CACHE.pop(oldest, None)
+    return rec
+
+
+def bind_session(sid="", reset=False):
+    """Bind ``session_id``/``exchanges``/``_recall_log`` to one session.
+
+    ``reset`` starts a fresh record (session start) instead of reusing the
+    existing one. Returns the bound record.
+    """
+    global session_id, exchanges, _recall_log
+    key = sid or _DEFAULT_SESSION_KEY
+    if reset:
+        _SESSION_CACHE.pop(key, None)
+    rec = _session_record(sid)
+    session_id = rec.session_id
+    exchanges = rec.exchanges
+    _recall_log = rec.recall_log
+    return rec
+
+
 session_id = ""
 exchanges: list = []
 
@@ -113,7 +195,9 @@ def log_recall(query, results, source="pre_llm_call"):
         "query": query[:100],
         "result_count": len(results),
         "result_ids": [r.get("id", "") for r in results[:5] if isinstance(r, dict)],
-        "result_summaries": [r.get("summary", "")[:60] for r in results[:5] if isinstance(r, dict)],
+        "result_summaries": [
+            r.get("summary", "")[:60] for r in results[:5] if isinstance(r, dict)
+        ],
         "session_id": session_id,
         "agent": AGENT_NAME,
     }
@@ -204,33 +288,42 @@ def build_brief():
         "items": [],
     }
     for t in open_tasks[:3]:
-        brief["pending"]["items"].append({
-            "from": t.get("agent", "?"),
-            "summary": t.get("summary", "?"),
-            "type": t.get("type", "?"),
-            "id": t.get("id", "?"),
-        })
+        brief["pending"]["items"].append(
+            {
+                "from": t.get("agent", "?"),
+                "summary": t.get("summary", "?"),
+                "type": t.get("type", "?"),
+                "id": t.get("id", "?"),
+            }
+        )
     for r in reviews[:3]:
-        brief["pending"]["items"].append({
-            "from": r.get("agent", "?"),
-            "summary": r.get("summary", "?"),
-            "type": "review",
-            "id": r.get("id", "?"),
-            "review_of": r.get("review_of", ""),
-        })
+        brief["pending"]["items"].append(
+            {
+                "from": r.get("agent", "?"),
+                "summary": r.get("summary", "?"),
+                "type": "review",
+                "id": r.get("id", "?"),
+                "review_of": r.get("review_of", ""),
+            }
+        )
     for t in open_tickets[:3]:
-        brief["pending"]["items"].append({
-            "from": t.get("agent", "?"),
-            "summary": t.get("summary", "?"),
-            "type": t.get("type", "ticket"),
-            "id": t.get("id", "?"),
-            "customer_id": t.get("customer_id", "?"),
-        })
+        brief["pending"]["items"].append(
+            {
+                "from": t.get("agent", "?"),
+                "summary": t.get("summary", "?"),
+                "type": t.get("type", "ticket"),
+                "id": t.get("id", "?"),
+                "customer_id": t.get("customer_id", "?"),
+            }
+        )
 
     # recent own work (last 5 entries by this agent)
     own = read_recent(agent=agent, limit=5)
     brief["recent_work"] = [
-        {"summary": e.get("summary", "?"), "timestamp": str(e.get("timestamp", ""))[:16]}
+        {
+            "summary": e.get("summary", "?"),
+            "timestamp": str(e.get("timestamp", ""))[:16],
+        }
         for e in own
     ]
 
@@ -241,15 +334,23 @@ def build_brief():
     # suggested action
     if open_tasks:
         t = open_tasks[0]
-        brief["suggested_action"] = f"Pick up: {t.get('summary', '?')} from {t.get('agent', '?')} (id {t.get('id', '?')})"
+        brief["suggested_action"] = (
+            f"Pick up: {t.get('summary', '?')} from {t.get('agent', '?')} (id {t.get('id', '?')})"
+        )
     elif reviews:
         r = reviews[0]
-        brief["suggested_action"] = f"Address review: {r.get('summary', '?')} from {r.get('agent', '?')} ({r.get('review_of', '')})"
+        brief["suggested_action"] = (
+            f"Address review: {r.get('summary', '?')} from {r.get('agent', '?')} ({r.get('review_of', '')})"
+        )
     elif open_tickets:
         t = open_tickets[0]
-        brief["suggested_action"] = f"Resolve ticket: {t.get('summary', '?')} [{t.get('customer_id', '?')}]"
+        brief["suggested_action"] = (
+            f"Resolve ticket: {t.get('summary', '?')} [{t.get('customer_id', '?')}]"
+        )
     else:
-        brief["suggested_action"] = "No pending work. Continue current task or check fabric_recall for context."
+        brief["suggested_action"] = (
+            "No pending work. Continue current task or check fabric_recall for context."
+        )
 
     # telemetry summary (if available)
     tel = get_telemetry(last_n=20)
@@ -281,6 +382,7 @@ def save_creative(s):
 
 # ── Fabric I/O ───────────────────────────────────────────
 
+
 def _yaml_scalar(value):
     """Encode a scalar as a YAML-safe quoted string."""
     return json.dumps(str(value))
@@ -294,6 +396,7 @@ def _parse_frontmatter_scalar(text, key):
     raw = m.group(1).strip()
     try:
         import yaml as _yaml
+
         value = _yaml.safe_load(raw)
     except Exception:
         value = raw
@@ -303,11 +406,32 @@ def _parse_frontmatter_scalar(text, key):
         return ", ".join(str(v) for v in value)
     return str(value)
 
-def write_entry(entry_type, content, summary, tier="hot", tags="", platform="cli",
-                status="", outcome="", review_of="", revises="", customer_id="",
-                assigned_to="", training_value="", verified="", evidence="",
-                source_tool="", artifact_paths=""):
-    """Write a fabric entry with full schema v1 fields. Returns the filepath."""
+
+def write_entry(
+    entry_type,
+    content,
+    summary,
+    tier="hot",
+    tags="",
+    platform="cli",
+    status="",
+    outcome="",
+    review_of="",
+    revises="",
+    customer_id="",
+    assigned_to="",
+    training_value="",
+    verified="",
+    evidence="",
+    source_tool="",
+    artifact_paths="",
+):
+    """Write a fabric entry with full schema v1 fields. Returns the filepath.
+
+    Raises ``ValueError`` when ``entry_type`` is not a safe slug, and refuses
+    to write outside ``FABRIC_DIR`` (path-traversal guard).
+    """
+    entry_type = _safe_entry_type(entry_type)
     FABRIC_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
     ts = now.strftime("%Y-%m-%dT%H%MZ")
@@ -315,7 +439,7 @@ def write_entry(entry_type, content, summary, tier="hot", tags="", platform="cli
     agent = AGENT_NAME or "agent"
     if not AGENT_NAME:
         logger.warning(
-            "icarus: HERMES_AGENT_NAME not set — fabric entries will use agent=\"agent\". "
+            'icarus: HERMES_AGENT_NAME not set — fabric entries will use agent="agent". '
             "Set HERMES_AGENT_NAME=<name> in .env for multi-agent deployments."
         )
     suffix = secrets.token_hex(2)
@@ -327,10 +451,11 @@ def write_entry(entry_type, content, summary, tier="hot", tags="", platform="cli
         filename = f"{agent}-{entry_type}-{ts}-{suffix}.md"
 
     sid = session_id or os.environ.get(
-        "FABRIC_SESSION_ID", f"sess-{now.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}")
+        "FABRIC_SESSION_ID", f"sess-{now.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+    )
     project_id = os.environ.get(
-        "FABRIC_PROJECT_ID",
-        Path.cwd().name if Path.cwd() != Path.home() else "unknown")
+        "FABRIC_PROJECT_ID", Path.cwd().name if Path.cwd() != Path.home() else "unknown"
+    )
 
     lines = [
         "---",
@@ -345,7 +470,9 @@ def write_entry(entry_type, content, summary, tier="hot", tags="", platform="cli
         f"session_id: {_yaml_scalar(sid)}",
     ]
     if tags:
-        lines.append(f"tags: {json.dumps([t.strip() for t in str(tags).split(',') if t.strip()])}")
+        lines.append(
+            f"tags: {json.dumps([t.strip() for t in str(tags).split(',') if t.strip()])}"
+        )
     if status:
         lines.append(f"status: {_yaml_scalar(status)}")
     if outcome:
@@ -367,10 +494,22 @@ def write_entry(entry_type, content, summary, tier="hot", tags="", platform="cli
     if source_tool:
         lines.append(f"source_tool: {_yaml_scalar(source_tool)}")
     if artifact_paths:
-        lines.append(f"artifact_paths: {json.dumps([p.strip() for p in str(artifact_paths).split(',') if p.strip()])}")
+        lines.append(
+            f"artifact_paths: {json.dumps([p.strip() for p in str(artifact_paths).split(',') if p.strip()])}"
+        )
     lines.extend(["---", "", content])
 
     path = FABRIC_DIR / filename
+    # Containment guard: even with a validated entry_type, a hostile agent name
+    # (env-controlled) could still contain a separator. Refuse anything that
+    # would land outside FABRIC_DIR rather than writing it.
+    try:
+        base = FABRIC_DIR.resolve()
+        resolved = path.resolve()
+    except OSError:
+        base, resolved = FABRIC_DIR, path
+    if resolved.parent != base:
+        raise ValueError(f"refusing to write outside FABRIC_DIR ({base}): {resolved}")
     content_str = "\n".join(lines)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(content_str, "utf-8")
@@ -381,7 +520,10 @@ def write_entry(entry_type, content, summary, tier="hot", tags="", platform="cli
     if os.environ.get("ICARUS_OBSIDIAN"):
         try:
             from . import obsidian
-            obsidian.format_entry(path, FABRIC_DIR, review_of=review_of, revises=revises)
+
+            obsidian.format_entry(
+                path, FABRIC_DIR, review_of=review_of, revises=revises
+            )
             obsidian.ensure_daily_note(FABRIC_DIR, filename, summary)
         except Exception as exc:
             logger.debug("icarus: obsidian formatting failed: %s", exc)
@@ -394,17 +536,21 @@ def read_recent(agent="", limit=5):
     if not FABRIC_DIR.exists():
         return []
     out = []
-    for f in sorted(FABRIC_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
+    for f in sorted(
+        FABRIC_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True
+    ):
         head = _parse_head(f)
         if head.get("tier") != "hot":
             continue
         if agent and head.get("agent") != agent:
             continue
-        out.append({
-            "agent": head.get("agent", ""),
-            "timestamp": head.get("timestamp", ""),
-            "summary": head.get("summary", ""),
-        })
+        out.append(
+            {
+                "agent": head.get("agent", ""),
+                "timestamp": head.get("timestamp", ""),
+                "summary": head.get("summary", ""),
+            }
+        )
         if len(out) >= limit:
             break
     return out
@@ -415,7 +561,9 @@ def read_cross_agent(limit=3):
     if not FABRIC_DIR.exists():
         return []
     out = []
-    for f in sorted(FABRIC_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
+    for f in sorted(
+        FABRIC_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True
+    ):
         head = _parse_head(f)
         if AGENT_NAME and head.get("agent") == AGENT_NAME:
             continue
@@ -434,11 +582,27 @@ def _parse_head(filepath, max_bytes=800):
     """Parse frontmatter fields from a fabric entry header."""
     text = filepath.read_text("utf-8")[:max_bytes]
     fields = {}
-    for key in ("agent", "type", "tier", "status", "summary", "timestamp",
-                "review_of", "revises", "customer_id", "assigned_to", "id",
-                "project_id", "session_id",
-                "outcome", "training_value", "verified", "evidence",
-                "source_tool", "artifact_paths"):
+    for key in (
+        "agent",
+        "type",
+        "tier",
+        "status",
+        "summary",
+        "timestamp",
+        "review_of",
+        "revises",
+        "customer_id",
+        "assigned_to",
+        "id",
+        "project_id",
+        "session_id",
+        "outcome",
+        "training_value",
+        "verified",
+        "evidence",
+        "source_tool",
+        "artifact_paths",
+    ):
         value = _parse_frontmatter_scalar(text, key)
         if value != "":
             fields[key] = value
@@ -461,7 +625,10 @@ def has_entry_ref(ref):
             continue
         for f in d.glob("*.md"):
             h = _parse_head(f)
-            if h.get("agent", "").strip() == agent and h.get("id", "").strip() == entry_id:
+            if (
+                h.get("agent", "").strip() == agent
+                and h.get("id", "").strip() == entry_id
+            ):
                 return True
     return False
 
@@ -469,7 +636,9 @@ def has_entry_ref(ref):
 def curate_entry(entry_id, training_value):
     """Update the training_value field on an existing fabric entry."""
     if training_value not in ("high", "normal", "low"):
-        return {"error": f"training_value must be high/normal/low, got '{training_value}'"}
+        return {
+            "error": f"training_value must be high/normal/low, got '{training_value}'"
+        }
 
     for d in (FABRIC_DIR, FABRIC_DIR / "cold"):
         if not d.exists():
@@ -482,11 +651,23 @@ def curate_entry(entry_id, training_value):
 
             text = f.read_text("utf-8")
             if re.search(r"^training_value: .+$", text, re.MULTILINE):
-                text = re.sub(r"^training_value: .+$", f"training_value: {training_value}", text, count=1, flags=re.MULTILINE)
+                text = re.sub(
+                    r"^training_value: .+$",
+                    f"training_value: {training_value}",
+                    text,
+                    count=1,
+                    flags=re.MULTILINE,
+                )
             else:
-                text = text.replace("\n---\n", f"\ntraining_value: {training_value}\n---\n", 1)
+                text = text.replace(
+                    "\n---\n", f"\ntraining_value: {training_value}\n---\n", 1
+                )
             f.write_text(text, "utf-8")
-            return {"status": "updated", "file": f.name, "training_value": training_value}
+            return {
+                "status": "updated",
+                "file": f.name,
+                "training_value": training_value,
+            }
 
     return {"error": f"entry {entry_id} not found"}
 
@@ -501,7 +682,9 @@ def read_pending(customer_id=None):
     reviews = []
     open_tickets = []
 
-    for f in sorted(FABRIC_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
+    for f in sorted(
+        FABRIC_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True
+    ):
         h = _parse_head(f)
         entry_agent = h.get("agent", "")
         assigned_to = h.get("assigned_to", "").strip()
@@ -548,8 +731,12 @@ def search_entries(query, limit=10):
             head = _parse_head(f)
             summary = head.get("summary", "")
             agent = head.get("agent", "")
-            matches = [line.strip() for line in text.split("\n") if q in line.lower()][:3]
-            results.append({"file": f.name, "agent": agent, "summary": summary, "matches": matches})
+            matches = [line.strip() for line in text.split("\n") if q in line.lower()][
+                :3
+            ]
+            results.append(
+                {"file": f.name, "agent": agent, "summary": summary, "matches": matches}
+            )
             if len(results) >= limit:
                 return results
     return results
@@ -571,6 +758,7 @@ def _load_retriever():
         if p and p.exists():
             try:
                 import importlib.util
+
                 spec = importlib.util.spec_from_file_location("fabric_retrieve", str(p))
                 mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mod)
@@ -591,7 +779,9 @@ def recall(query, max_results=5, agent=None, project=None):
 
     _retriever.FABRIC_DIR = FABRIC_DIR
     try:
-        results = _retriever.retrieve(query, max_results=max_results, agent=agent, project=project)
+        results = _retriever.retrieve(
+            query, max_results=max_results, agent=agent, project=project
+        )
         return [{"score": score, **entry} for score, entry in results]
     except Exception as exc:
         logger.debug("icarus: retrieval error: %s", exc)
@@ -599,6 +789,7 @@ def recall(query, max_results=5, agent=None, project=None):
 
 
 # ── Training ─────────────────────────────────────────────
+
 
 def _together_key():
     key = os.environ.get("TOGETHER_API_KEY", "")
@@ -652,7 +843,9 @@ def export_training(mode="normal"):
             tokens = int(m.group(1).replace(",", ""))
 
         together_path = Path(tmpdir) / "together.jsonl"
-        training_data = together_path.read_text("utf-8") if together_path.exists() else ""
+        training_data = (
+            together_path.read_text("utf-8") if together_path.exists() else ""
+        )
 
         pair_types = {}
         raw_pairs_path = Path(tmpdir) / "raw-pairs.json"
@@ -671,9 +864,12 @@ def export_training(mode="normal"):
             "mode": mode,
             "pair_types": pair_types,
             "output": output.strip(),
-            "training_data_path": str(together_path) if together_path.exists() else None,
+            "training_data_path": str(together_path)
+            if together_path.exists()
+            else None,
             "_training_data": training_data,
         }
+
 
 def _select_training_export_mode(min_pairs):
     """Choose the highest-quality export mode that still has enough pairs."""
@@ -693,8 +889,16 @@ def _select_training_export_mode(min_pairs):
     return "normal", {"error": "export failed"}, tried
 
 
-def start_training(model=None, suffix=None, epochs=3, batch_size=None, learning_rate=None,
-                   checkpoints=None, mode=None, min_pairs=10):
+def start_training(
+    model=None,
+    suffix=None,
+    epochs=3,
+    batch_size=None,
+    learning_rate=None,
+    checkpoints=None,
+    mode=None,
+    min_pairs=10,
+):
     """Export, upload, and start a Together AI fine-tune."""
     key = _together_key()
     if not key:
@@ -712,7 +916,9 @@ def start_training(model=None, suffix=None, epochs=3, batch_size=None, learning_
         return {
             "error": f"only {export['pairs']} pairs in {export_mode}, need at least {min_pairs}",
             "mode": export_mode,
-            "tried_modes": {k: v.get("pairs", 0) for k, v in tried_modes.items() if "error" not in v},
+            "tried_modes": {
+                k: v.get("pairs", 0) for k, v in tried_modes.items() if "error" not in v
+            },
         }
 
     training_data = export.get("_training_data", "")
@@ -752,9 +958,21 @@ def start_training(model=None, suffix=None, epochs=3, batch_size=None, learning_
     agent = AGENT_NAME or "agent"
     ft_model = model or os.environ.get("TOGETHER_MODEL", "Qwen/Qwen2-7B-Instruct")
     ft_suffix = suffix or os.environ.get("TOGETHER_SUFFIX", f"{agent}-v1")
-    ft_batch = int(batch_size if batch_size is not None else os.environ.get("TOGETHER_BATCH_SIZE", "8"))
-    ft_lr = float(learning_rate if learning_rate is not None else os.environ.get("TOGETHER_LR", "1e-5"))
-    ft_checkpoints = int(checkpoints if checkpoints is not None else os.environ.get("TOGETHER_CHECKPOINTS", "1"))
+    ft_batch = int(
+        batch_size
+        if batch_size is not None
+        else os.environ.get("TOGETHER_BATCH_SIZE", "8")
+    )
+    ft_lr = float(
+        learning_rate
+        if learning_rate is not None
+        else os.environ.get("TOGETHER_LR", "1e-5")
+    )
+    ft_checkpoints = int(
+        checkpoints
+        if checkpoints is not None
+        else os.environ.get("TOGETHER_CHECKPOINTS", "1")
+    )
 
     if ft_batch < 8:
         return {"error": f"batch_size must be >= 8 (got {ft_batch})"}
@@ -764,15 +982,19 @@ def start_training(model=None, suffix=None, epochs=3, batch_size=None, learning_
         return {"error": f"n_checkpoints must be >= 1 (got {ft_checkpoints})"}
 
     try:
-        ft_data = _together_request("POST", "https://api.together.xyz/v1/fine-tunes", {
-            "training_file": file_id,
-            "model": ft_model,
-            "n_epochs": epochs,
-            "suffix": ft_suffix,
-            "batch_size": ft_batch,
-            "learning_rate": ft_lr,
-            "n_checkpoints": ft_checkpoints,
-        })
+        ft_data = _together_request(
+            "POST",
+            "https://api.together.xyz/v1/fine-tunes",
+            {
+                "training_file": file_id,
+                "model": ft_model,
+                "n_epochs": epochs,
+                "suffix": ft_suffix,
+                "batch_size": ft_batch,
+                "learning_rate": ft_lr,
+                "n_checkpoints": ft_checkpoints,
+            },
+        )
     except Exception as exc:
         return {"error": f"fine-tune start failed: {exc}"}
 
@@ -784,20 +1006,22 @@ def start_training(model=None, suffix=None, epochs=3, batch_size=None, learning_
 
     # register as pending in model registry
     registry = _load_registry()
-    registry["models"].append({
-        "job_id": job_id,
-        "base_model": ft_model,
-        "output_model": None,
-        "suffix": ft_suffix,
-        "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "pair_count": export["pairs"],
-        "estimated_tokens": export.get("estimated_tokens", 0),
-        "pair_types": export.get("pair_types", {}),
-        "export_mode": export_mode,
-        "status": "pending",
-        "eval_scores": None,
-        "active": False,
-    })
+    registry["models"].append(
+        {
+            "job_id": job_id,
+            "base_model": ft_model,
+            "output_model": None,
+            "suffix": ft_suffix,
+            "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "pair_count": export["pairs"],
+            "estimated_tokens": export.get("estimated_tokens", 0),
+            "pair_types": export.get("pair_types", {}),
+            "export_mode": export_mode,
+            "status": "pending",
+            "eval_scores": None,
+            "active": False,
+        }
+    )
     _save_registry(registry)
 
     return {
@@ -837,7 +1061,9 @@ def check_training(job_id=None):
             m["status"] = "completed"
             m["output_model"] = data.get("model_output_name", "")
             result["model_id"] = m["output_model"]
-            result["instruction"] = f"Run fabric_eval to test, then fabric_switch_model to activate."
+            result["instruction"] = (
+                f"Run fabric_eval to test, then fabric_switch_model to activate."
+            )
         elif data.get("status") in ("failed", "cancelled", "error"):
             m["status"] = data["status"]
             result["error"] = data.get("error", "unknown")
@@ -860,16 +1086,23 @@ def run_eval(candidate_model, base_model=None, sample_count=10):
     base = base_model or os.environ.get("LLM_MODEL", "Qwen/Qwen2-7B-Instruct")
 
     cmd = [
-        "python3", str(eval_script),
-        "--candidate-model", candidate_model,
-        "--base-model", base,
-        "--sample-count", str(sample_count),
-        "--fabric-dir", str(FABRIC_DIR),
+        "python3",
+        str(eval_script),
+        "--candidate-model",
+        candidate_model,
+        "--base-model",
+        base,
+        "--sample-count",
+        str(sample_count),
+        "--fabric-dir",
+        str(FABRIC_DIR),
     ]
     env = os.environ.copy()
     env["TOGETHER_API_KEY"] = key
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=300, env=env
+        )
     except subprocess.TimeoutExpired:
         return {"error": "eval timed out (5 min limit)"}
 
@@ -892,11 +1125,35 @@ def run_eval(candidate_model, base_model=None, sample_count=10):
     return scores
 
 
+# Written into .env instead of the real secret. Persisting the API key in
+# plaintext on disk is a credential leak: .env files get backed up, synced and
+# pasted into tickets. The operator supplies the value via the environment.
+_ENV_KEY_PLACEHOLDER = "__SET_FROM_ENV_TOGETHER_API_KEY__"
+
+
+def _new_env_backup_path() -> Path:
+    """Unique, timestamped ``.env`` backup path.
+
+    The old fixed ``.env.backup`` name was overwritten by every switch, so a
+    second switch destroyed the only path back to the original configuration.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return HERMES_HOME / f".env.backup.{stamp}.{secrets.token_hex(3)}"
+
+
+def _latest_env_backup():
+    """Most recent ``.env`` backup (also matches the legacy fixed name)."""
+    try:
+        candidates = [p for p in HERMES_HOME.glob(".env.backup*") if p.is_file()]
+    except OSError:
+        candidates = []
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
 def switch_model(model_id, min_eval_score=0.7):
     """Switch the agent to use a replacement model."""
-    if not HERMES_HOME:
-        return {"error": "HERMES_HOME not set"}
-
     env_file = HERMES_HOME / ".env"
     if not env_file.exists():
         return {"error": f".env not found at {env_file}"}
@@ -934,8 +1191,8 @@ def switch_model(model_id, min_eval_score=0.7):
         if l.startswith("LLM_MODEL="):
             old_model = l.split("=", 1)[1].strip()
 
-    # backup .env
-    backup = HERMES_HOME / ".env.backup"
+    # backup .env — unique, timestamped name (never clobbers an earlier backup)
+    backup = _new_env_backup_path()
     shutil.copy2(env_file, backup)
 
     key = _together_key()
@@ -946,17 +1203,32 @@ def switch_model(model_id, min_eval_score=0.7):
     # provider config deliberately and rely on the backup / rollback path to
     # preserve the previous provider state.
     filtered = [
-        l for l in lines
+        l
+        for l in lines
         if not l.startswith(("LLM_MODEL=", "OPENAI_BASE_URL=", "OPENAI_API_KEY="))
     ]
     filtered.append(f"LLM_MODEL={model_id}")
     filtered.append("OPENAI_BASE_URL=https://api.together.xyz/v1")
-    filtered.append(f"OPENAI_API_KEY={key}")
+    # A placeholder, not the secret: the old code wrote the live API key into
+    # .env in plaintext, which leaks the credential to every backup/sync/ticket
+    # that file ever touches.
+    filtered.append(f"OPENAI_API_KEY={_ENV_KEY_PLACEHOLDER}")
 
-    # atomic write
+    # Atomic write. os.replace() overwrites the destination on both POSIX and
+    # Windows; Path.rename() raises FileExistsError on Windows when .env already
+    # exists, which made every switch fail with the file present.
     tmp = env_file.with_suffix(".tmp")
     tmp.write_text("\n".join(filtered), "utf-8")
-    tmp.rename(env_file)
+    os.replace(tmp, env_file)
+
+    logger.warning(
+        "icarus: OPENAI_API_KEY was written to %s as the placeholder %r — no "
+        "secret was persisted. Set OPENAI_API_KEY (value = your "
+        "TOGETHER_API_KEY) in the process environment before the next run, or "
+        "the replacement model cannot authenticate.",
+        env_file,
+        _ENV_KEY_PLACEHOLDER,
+    )
 
     # update registry
     for m in registry["models"]:
@@ -966,7 +1238,11 @@ def switch_model(model_id, min_eval_score=0.7):
     registry["active_model"] = model_id
     _save_registry(registry)
 
-    rollback = f"fabric_switch_model(model_id='{old_model}')" if old_model else "restore from .env.backup"
+    rollback = (
+        f"fabric_switch_model(model_id='{old_model}')"
+        if old_model
+        else f"restore from {backup.name}"
+    )
     return {
         "status": "switched",
         "old_model": old_model,
@@ -978,14 +1254,13 @@ def switch_model(model_id, min_eval_score=0.7):
 
 
 def rollback_model():
-    """Restore .env from backup and deactivate current model in registry."""
-    if not HERMES_HOME:
-        return {"error": "HERMES_HOME not set"}
-
-    backup = HERMES_HOME / ".env.backup"
+    """Restore .env from the newest backup and deactivate the current model."""
     env_file = HERMES_HOME / ".env"
 
-    if not backup.exists():
+    # Newest backup wins — the legacy fixed ".env.backup" name is still honoured
+    # so pre-upgrade deployments keep working.
+    backup = _latest_env_backup()
+    if backup is None:
         return {"error": "no .env.backup found — nothing to roll back to"}
 
     # read what we're rolling back from
@@ -1024,6 +1299,7 @@ def rollback_model():
 
 
 # ── Session scoring ───────────────────────────────────────
+
 
 def _count_session_entries():
     """Count entries written during the current session."""
@@ -1074,17 +1350,29 @@ def score_session():
     all_text = " ".join(ex.get("assistant", "") for ex in exchanges)
     has_decision = bool(DECISION_RE.search(all_text))
     has_outcome = bool(OUTCOME_RE.search(all_text))
-    scores["decision"] = 1.0 if (has_decision and has_outcome) else (0.5 if has_decision else 0.0)
+    scores["decision"] = (
+        1.0 if (has_decision and has_outcome) else (0.5 if has_decision else 0.0)
+    )
 
-    tel = get_telemetry(last_n=500, session_id_filter=session_id, agent_filter=AGENT_NAME)
+    tel = get_telemetry(
+        last_n=500, session_id_filter=session_id, agent_filter=AGENT_NAME
+    )
     scores["recall_usage"] = tel.get("summary", {}).get("usage_rate", 0.0)
 
     scores["linked_entries"] = min(_count_session_linked_entries() / 2, 1.0)
 
-    substantial_user = sum(1 for ex in exchanges if len(ex.get("user", "").strip()) > 50)
+    substantial_user = sum(
+        1 for ex in exchanges if len(ex.get("user", "").strip()) > 50
+    )
     scores["user_engagement"] = min(substantial_user / 3, 1.0)
 
-    weights = {"depth": 2, "decision": 3, "recall_usage": 2, "linked_entries": 2, "user_engagement": 1}
+    weights = {
+        "depth": 2,
+        "decision": 3,
+        "recall_usage": 2,
+        "linked_entries": 2,
+        "user_engagement": 1,
+    }
     total = sum(scores[k] * weights[k] for k in scores) / sum(weights.values())
     scores["total"] = round(total, 2)
 
@@ -1092,6 +1380,7 @@ def score_session():
 
 
 # ── Corpus reporting ─────────────────────────────────────
+
 
 def get_entry_usage_stats():
     """Per-entry-type recall and usage rates from telemetry."""
@@ -1125,7 +1414,9 @@ def get_entry_usage_stats():
             t: {
                 "recalled": type_recalled.get(t, 0),
                 "used": type_used.get(t, 0),
-                "usage_rate": round(type_used.get(t, 0) / max(type_recalled.get(t, 0), 1), 2),
+                "usage_rate": round(
+                    type_used.get(t, 0) / max(type_recalled.get(t, 0), 1), 2
+                ),
             }
             for t in all_types
         },
@@ -1172,6 +1463,7 @@ def build_weekly_report():
 
 # ── SOUL ─────────────────────────────────────────────────
 
+
 def load_soul():
     if HERMES_HOME:
         soul = HERMES_HOME / "SOUL.md"
@@ -1182,6 +1474,7 @@ def load_soul():
 
 # ── Memory file ──────────────────────────────────────────
 
+
 def write_memory_file(s):
     """Write Icarus creative state to CREATIVE.md — NOT to MEMORY.md.
 
@@ -1189,8 +1482,7 @@ def write_memory_file(s):
     Writing to it from here caused drift that blocked memory persistence
     (issue #26045).  CREATIVE.md is safe because nothing else writes to it.
     """
-    if not HERMES_HOME:
-        return
+    # HERMES_HOME is always resolved, so this never silently no-ops.
     mem_dir = HERMES_HOME / "memories"
     mem_dir.mkdir(parents=True, exist_ok=True)
     agent = AGENT_NAME or "agent"

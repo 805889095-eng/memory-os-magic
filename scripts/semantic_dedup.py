@@ -38,7 +38,8 @@ SCROLL_LIMIT = 50  # paginação Qdrant (evita timeout em coleções grandes)
 SIMILARITY_THRESHOLD = 0.92
 TOP_NEIGHBORS = 10
 
-LOG_DIR = Path.home() / ".hermes" / "logs"
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+LOG_DIR = HERMES_HOME / "logs"
 LOG_FILE = LOG_DIR / "semantic_dedup.log"
 REPORT_FILE = LOG_DIR / "semantic_dedup_report.json"
 

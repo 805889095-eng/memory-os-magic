@@ -58,7 +58,7 @@ curl -s -X PUT http://localhost:6333/collections/knowledge_base \
 | Step | Component | Details |
 |------|-----------|---------|
 | Dense embedding | Qwen3-Embedding-8B via OpenRouter | 4096 dimensions, 32K context, $0.01/1M tokens |
-| Sparse embedding | FastEmbed BM25 (local) | Runs in-process, no API call |
+| Sparse embedding | Pure-Python BM25 (`scripts/bm25_tf.py`) | Tokenizes in-process; emits only the BM25 tf saturation term. IDF is applied server-side by Qdrant (`Modifier.IDF`). No model, no API call. |
 | Queue | Redis (ARQ) | Async job queue for ingestion |
 | Worker | Docker (ARQ Worker) | Processes embedding + Qdrant upsert |
 
@@ -219,9 +219,15 @@ For heterogeneous operations (different payload per point group), use `POST /col
 
 See the official Qdrant migration guide. The async client replaces `.search()` with `.query_points()` and changes return types.
 
-### Python environment mismatch with FastEmbed/ONNX Runtime
+### Sparse vectors are pure Python (no ONNX, no native extension)
 
-FastEmbed depends on `onnxruntime` which loads compiled NumPy extensions. Cross-version `sys.path.insert` triggers `ModuleNotFoundError: No module named 'numpy._core._multiarray_umath'`. Always execute scripts directly with the venv's Python binary: `/path/to/venv/bin/python script.py`.
+Sparse retrieval no longer loads any native extension. `scripts/bm25_tf.py` (host scripts) and `docker/worker/services/bm25_tf.py` (worker) are identical, pure-Python modules:
+
+- Tokenizer: `re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]", text.lower())` — ASCII word/digit runs stay whole, each CJK ideograph is its own token; **no stemming**.
+- Token → index: `zlib.crc32(token.encode("utf-8"))` — a stable uint32, so ingest and query derive identical indices across processes.
+- The module emits only the BM25 **tf saturation** term. **IDF is applied server-side by Qdrant** via `Modifier.IDF` on the sparse index — the client never computes idf.
+
+Because there is no `onnxruntime` and no compiled NumPy extension, the old cross-version `sys.path.insert` trap (`ModuleNotFoundError: No module named 'numpy._core._multiarray_umath'`) is gone.
 
 ### RRF score threshold
 

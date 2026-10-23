@@ -4,10 +4,12 @@ verify_soul_config.py — Check whether SOUL.md has Memory OS Ground Truth Hiera
 Exits 0 if all checks pass, 1 if any are missing.
 """
 
+import os
 import sys
 from pathlib import Path
 
-SOUL_PATH = Path.home() / ".hermes" / "SOUL.md"
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+SOUL_PATH = HERMES_HOME / "SOUL.md"
 MEMORY_OS_MARKER = "<!-- Memory OS additions — do not duplicate -->"
 
 CHECKS = {

@@ -6,6 +6,13 @@ for prompt enrichment.
 Runs as a synchronous function (fast, <1s) before each Hermes response.
 If Qdrant is offline or embedding fails, returns "" (fail-open).
 
+Zero local models: dense embedding is remote-only (OpenAI-compatible
+`POST {EMBEDDING_API_BASE}/embeddings`) and the sparse BM25 vector is pure
+Python (`scripts/bm25_tf.py`, no model, no subprocess, no network).
+
+Dense embedding fails loudly: a missing API key raises RuntimeError instead of
+silently degrading to keyword-only retrieval.
+
 Usage:
   python3 context_enhancer.py "your query here"
   python3 context_enhancer.py --top-k 5 --threshold 0.50 "deploy docker"
@@ -18,7 +25,6 @@ import json
 import uuid
 import hashlib
 import sqlite3
-import subprocess
 import requests
 import argparse
 import re
@@ -28,50 +34,55 @@ from pathlib import Path
 import time
 from datetime import datetime, timezone
 
-# ─── Config ────────────────────────────────────────────────────────────────
-OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
-if not OPENROUTER_KEY:
-    env_path = Path.home() / ".env"
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            if line.startswith("OPENROUTER_API_KEY="):
-                OPENROUTER_KEY = line.split("=", 1)[1].strip().strip('"')
-                break
+# Pure-Python BM25 tf (shared verbatim with docker/worker/services/bm25_tf.py).
+# Works both as a standalone script and as `from scripts.context_enhancer import ...`.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+from bm25_tf import bm25_tf  # noqa: E402
 
+# ─── Config ────────────────────────────────────────────────────────────────
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 COLLECTION = os.environ.get("QDRANT_COLLECTION", "knowledge_base")
 
+# Dense embedding — remote only (unified config contract)
+EMBEDDING_API_BASE = os.environ.get(
+    "EMBEDDING_API_BASE", "https://openrouter.ai/api/v1"
+)
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "qwen/qwen3-embedding-8b")
+EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
+EMBEDDING_PASS_DIMENSIONS = os.environ.get("EMBEDDING_PASS_DIMENSIONS", "auto").lower()
 TOP_K_DEFAULT = 3
 SCORE_THRESHOLD_DEFAULT = 0.55
 MAX_TEXT_LEN = 8000
 REQUEST_TIMEOUT = 10
 
-# FastEmbed BM25 config
-FASTEMBED_VENV = os.environ.get("FASTEMBED_VENV", "")
-
-# Default: use current Python if venv not configured
-_FASTEMBED_PYTHON = FASTEMBED_VENV if FASTEMBED_VENV else sys.executable
-_FASTEMBED_SITEPKGS = os.environ.get(
-    "FASTEMBED_SITEPKGS",
-    os.path.join(os.path.dirname(sys.executable), "../lib/python3.12/site-packages")
-)
-BM25_MODEL = "Qdrant/bm25"
+# Sparse BM25 hyper-parameters (Qdrant applies the IDF modifier server-side).
+BM25_K1 = float(os.environ.get("BM25_K1", "1.2"))
+BM25_B = float(os.environ.get("BM25_B", "0.75"))
+BM25_AVG_LEN = float(os.environ.get("BM25_AVG_LEN", "256.0"))
 
 # Lineage config
 LINEAGE_DB = os.environ.get(
     "STATE_DB_PATH",
-    os.path.expanduser("~/.hermes/state.db")
+    os.path.join(
+        os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "state.db"
+    ),
 )
 
 # Telemetry config
 TELEMETRY_LOG = os.environ.get(
     "TELEMETRY_LOG_PATH",
-    os.path.expanduser("~/.hermes/logs/query-telemetry.jsonl")
+    os.path.join(
+        os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+        "logs",
+        "query-telemetry.jsonl",
+    ),
 )
 TELEMETRY_MAX_BYTES = 10 * 1024 * 1024  # 10MB rotation
 
 # ─── Lineage Registration ───────────────────────────────────────────────────
+
 
 def register_lineage(
     session_id: str,
@@ -93,9 +104,14 @@ def register_lineage(
                                      generation_model, generation_context_hash, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
                 """,
-                (lineage_id, session_id, query,
-                 json.dumps(retrieved_chunk_ids, ensure_ascii=False),
-                 generation_model, generation_context_hash)
+                (
+                    lineage_id,
+                    session_id,
+                    query,
+                    json.dumps(retrieved_chunk_ids, ensure_ascii=False),
+                    generation_model,
+                    generation_context_hash,
+                ),
             )
             conn.commit()
         return lineage_id
@@ -106,10 +122,14 @@ def register_lineage(
 
 # ─── Telemetry ─────────────────────────────────────────────────────────────
 
+
 def _rotate_telemetry_if_needed() -> None:
     """Rotate telemetry file if >10MB. Rename to .1 and restart."""
     try:
-        if os.path.exists(TELEMETRY_LOG) and os.path.getsize(TELEMETRY_LOG) > TELEMETRY_MAX_BYTES:
+        if (
+            os.path.exists(TELEMETRY_LOG)
+            and os.path.getsize(TELEMETRY_LOG) > TELEMETRY_MAX_BYTES
+        ):
             rotated = TELEMETRY_LOG + ".1"
             if os.path.exists(rotated):
                 os.remove(rotated)
@@ -141,14 +161,26 @@ def estimate_tokens(text: str) -> int:
 
 _INJECTION_PATTERNS_CE = [
     # "ignore all previous/prior instructions/directives"
-    (re.compile(r"(?i)\bignore\s+all\s+(previous|prior)\s+(instructions|directives|commands|messages|prompts|context)"),
-     "[REDACTED]"),
+    (
+        re.compile(
+            r"(?i)\bignore\s+all\s+(previous|prior)\s+(instructions|directives|commands|messages|prompts|context)"
+        ),
+        "[REDACTED]",
+    ),
     # "you are/will now become/act/acting as (a/an) AI/assistant..."
-    (re.compile(r"(?i)\byou\s+(are|will\s+now)\s+(now\s+)?(become|act|acting)\s+as\s+(a\s+|an\s+)?(AI\s+assistant|assistant|AI|agent|LLM|chatbot|model|system)"),
-     "[REDACTED]"),
+    (
+        re.compile(
+            r"(?i)\byou\s+(are|will\s+now)\s+(now\s+)?(become|act|acting)\s+as\s+(a\s+|an\s+)?(AI\s+assistant|assistant|AI|agent|LLM|chatbot|model|system)"
+        ),
+        "[REDACTED]",
+    ),
     # "new instructions/directives/commands follow/above/below"
-    (re.compile(r"(?i)\bnew\s+(instructions|directives|commands)\s+(follow|above|below)"),
-     "[REDACTED]"),
+    (
+        re.compile(
+            r"(?i)\bnew\s+(instructions|directives|commands)\s+(follow|above|below)"
+        ),
+        "[REDACTED]",
+    ),
     # Template injection: {{...}}, ${...}
     (re.compile(r"\{\{.*?\}\}|\$\{.*?\}"), "[REDACTED]"),
     # Markdown/javascript data: URLs in links and images
@@ -180,70 +212,143 @@ def _strip_prompt_injection(text: str) -> str:
 
 # ─── Core ───────────────────────────────────────────────────────────────────
 
-def embed_query(text: str) -> Optional[List[float]]:
-    """Generate dense embedding via OpenRouter qwen/qwen3-embedding-8b."""
-    if not OPENROUTER_KEY:
+
+def resolve_embedding_api_key() -> Optional[str]:
+    """Resolve the embedding API key at call time.
+
+    Order: EMBEDDING_API_KEY → OPENROUTER_API_KEY (only when the base points at
+    OpenRouter) → ``~/.env`` (host deployments keep the key there).
+    Resolved per call so runtime env mutations (e.g. the Icarus hook exporting
+    OPENROUTER_API_KEY right before invoking us) are honoured.
+    """
+    key = os.environ.get("EMBEDDING_API_KEY") or ""
+    if key:
+        return key
+    if "openrouter" not in EMBEDDING_API_BASE.lower():
         return None
-    try:
+    key = os.environ.get("OPENROUTER_API_KEY") or ""
+    if key:
+        return key
+    env_path = Path.home() / ".env"
+    if env_path.exists():
+        try:
+            for line in env_path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines():
+                if line.startswith("OPENROUTER_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"')
+        except OSError as e:
+            print(f"[CE-ERROR] Could not read {env_path}: {e}", file=sys.stderr)
+    return None
+
+
+def embed_query(text: str) -> List[float]:
+    """Generate a dense embedding via the remote OpenAI-compatible endpoint.
+
+    Remote-only, no local model, no silent degradation:
+      * missing key  → RuntimeError
+      * wrong dims   → ValueError
+      * HTTP error   → requests.HTTPError (propagated)
+    """
+    api_key = resolve_embedding_api_key()
+    if not api_key:
+        raise RuntimeError(
+            "Dense embedding unavailable: EMBEDDING_API_KEY is not configured "
+            "(nor OPENROUTER_API_KEY for an OpenRouter base). Set one of them in "
+            "the environment / .env — local embedding models are no longer supported."
+        )
+
+    payload: dict = {
+        "model": EMBEDDING_MODEL,
+        "input": text[:MAX_TEXT_LEN],
+    }
+    should_pass_dims = EMBEDDING_PASS_DIMENSIONS == "true" or (
+        EMBEDDING_PASS_DIMENSIONS == "auto" and "text-embedding-3" in EMBEDDING_MODEL.lower()
+    )
+    if should_pass_dims:
+        payload["dimensions"] = EMBEDDING_DIMS
+
+    resp = requests.post(
+        f"{EMBEDDING_API_BASE.rstrip('/')}/embeddings",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
+    )
+    if resp.status_code == 400 and ("20015" in resp.text or "dimensions" in resp.text.lower()) and "dimensions" in payload:
+        payload.pop("dimensions", None)
         resp = requests.post(
-            "https://openrouter.ai/api/v1/embeddings",
+            f"{EMBEDDING_API_BASE.rstrip('/')}/embeddings",
             headers={
-                "Authorization": f"Bearer {OPENROUTER_KEY}",
-                "Content-Type": "application/json"
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
             },
-            json={
-                "model": EMBEDDING_MODEL,
-                "input": text[:MAX_TEXT_LEN]
-            },
-            timeout=REQUEST_TIMEOUT
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
         )
-        resp.raise_for_status()
-        return resp.json()["data"][0]["embedding"]
-    except Exception as e:
-        # Fail-open: log silently, return None
-        print(f"[CE-ERROR] Embedding dense failed: {e}", file=sys.stderr)
-        return None
+    resp.raise_for_status()
+    vector = resp.json()["data"][0]["embedding"]
+    if len(vector) != EMBEDDING_DIMS:
+        raise ValueError(
+            f"Embedding dimension mismatch: EMBEDDING_DIMS={EMBEDDING_DIMS}, "
+            f"API returned {len(vector)}"
+        )
+    return vector
 
 
-def embed_query_sparse(text: str) -> Optional[Tuple[List[int], List[float]]]:
-    """
-    Generate sparse BM25 embedding via FastEmbed (subprocess in ai-lab venv).
-    Query text passes via stdin — never embedded in a -c code string.
-    Fail-open: if it fails, return None. Caller falls back to dense-only.
+def embed_query_sparse(text: str) -> Dict[str, List]:
+    """Generate the sparse BM25 vector as a plain Python dict.
+
+    Returns ``{"indices": [int, ...], "values": [float, ...]}`` (Qdrant
+    compatible), indices deduplicated and ascending. Pure Python — no model, no
+    subprocess, no network. IDF is applied by Qdrant's Modifier.IDF, never here.
     """
     try:
-        result = subprocess.run(
-            [_FASTEMBED_PYTHON, "-c", """\
-import os, sys, json
-sys.path.insert(0, os.environ["FASTEMBED_SITEPKGS"])
-from fastembed.sparse import SparseTextEmbedding
-query = sys.stdin.read()
-model = SparseTextEmbedding(model_name="Qdrant/bm25")
-sparse = list(model.embed([query]))[0]
-print(json.dumps({"indices": sparse.indices.tolist(), "values": sparse.values.tolist()}))
-"""],
-            input=text,
-            capture_output=True, text=True, timeout=15
-        )
-        data = json.loads(result.stdout.strip())
-        return data["indices"], data["values"]
+        return bm25_tf(text, k1=BM25_K1, b=BM25_B, avg_len=BM25_AVG_LEN)
     except Exception as e:
-        print(f"[CE-ERROR] Embedding sparse failed: {e}", file=sys.stderr)
+        # Never silent — bm25_tf only raises on programming errors.
+        print(f"[CE-ERROR] Sparse BM25 generation failed: {e}", file=sys.stderr)
+        raise
+
+
+def _normalize_sparse(sparse_vector) -> Optional[Tuple[List[int], List[float]]]:
+    """Accept either the canonical dict or a legacy (indices, values) tuple."""
+    if sparse_vector is None:
         return None
+    if isinstance(sparse_vector, dict):
+        indices = sparse_vector.get("indices") or []
+        values = sparse_vector.get("values") or []
+    else:
+        try:
+            indices, values = sparse_vector[0], sparse_vector[1]
+        except (TypeError, IndexError, KeyError):
+            print(
+                "[CE-ERROR] Invalid sparse vector (expected dict or 2-tuple), ignoring.",
+                file=sys.stderr,
+            )
+            return None
+    if not indices:
+        return None
+    return list(indices), list(values)
 
 
 def search_knowledge_base(
     dense_vector: List[float],
-    sparse_vector: Optional[Tuple[List[int], List[float]]] = None,
+    sparse_vector: Optional[Dict] = None,
     top_k: int = TOP_K_DEFAULT,
-    score_threshold: float = SCORE_THRESHOLD_DEFAULT
+    score_threshold: float = SCORE_THRESHOLD_DEFAULT,
 ) -> List[Dict]:
     """
     Hybrid search in Qdrant: dense (semantic) + sparse (BM25 keyword)
     via prefetch + RRF. If sparse fails, fall back to dense-only.
+    ``sparse_vector`` is the pure-Python dict from ``embed_query_sparse``
+    (a legacy (indices, values) tuple is still accepted).
     """
+    sparse = _normalize_sparse(sparse_vector)
     try:
-        if sparse_vector is not None:
+        if sparse is not None:
             # Hybrid: prefetch dense + prefetch sparse → RRF
             resp = requests.post(
                 f"{QDRANT_URL}/collections/{COLLECTION}/points/query",
@@ -251,8 +356,14 @@ def search_knowledge_base(
                 json={
                     "prefetch": [
                         {"query": dense_vector, "using": "dense", "limit": top_k * 3},
-                        {"query": {"indices": sparse_vector[0], "values": sparse_vector[1]},
-                         "using": "sparse", "limit": top_k * 3},
+                        {
+                            "query": {
+                                "indices": sparse[0],
+                                "values": sparse[1],
+                            },
+                            "using": "sparse",
+                            "limit": top_k * 3,
+                        },
                     ],
                     "query": {"fusion": "rrf"},
                     "limit": top_k * 2,
@@ -278,20 +389,28 @@ def search_knowledge_base(
         results = []
         raw_results = data.get("result", {})
         # API /points/search returns direct list; API /points/query returns {"points": [...]}
-        points = raw_results if isinstance(raw_results, list) else raw_results.get("points", [])
+        points = (
+            raw_results
+            if isinstance(raw_results, list)
+            else raw_results.get("points", [])
+        )
         for r in points:
             score = r.get("score", 0)
             if score < score_threshold:
                 continue
             payload = r.get("payload", {})
-            results.append({
-                "id": r.get("id", "unknown"),
-                "score": score,
-                "title": payload.get("title", "Untitled"),
-                "content_preview": _strip_prompt_injection((payload.get("text", "") or "")[:400]),
-                "source": payload.get("source", "unknown"),
-                "tags": payload.get("tags", [])
-            })
+            results.append(
+                {
+                    "id": r.get("id", "unknown"),
+                    "score": score,
+                    "title": payload.get("title", "Untitled"),
+                    "content_preview": _strip_prompt_injection(
+                        (payload.get("text", "") or "")[:400]
+                    ),
+                    "source": payload.get("source", "unknown"),
+                    "tags": payload.get("tags", []),
+                }
+            )
         return results
     except Exception as e:
         print(f"[CE-ERROR] Qdrant search failed: {e}", file=sys.stderr)
@@ -300,18 +419,59 @@ def search_knowledge_base(
 
 # ─── Fallback: Lexical Search in Vault ──────────────────────────────────────
 
+
 def tokenize_query(text: str) -> List[str]:
     """Tokenize query into relevant terms (lowercase, alphanumeric)."""
     # Remove basic Portuguese/English stopwords
-    stopwords = {"o", "a", "os", "as", "um", "uma", "de", "da", "do", "em", "no", "na", "para", "com", "por", "que", "se", "e", "ou", "mas", "the", "a", "an", "is", "are", "was", "were", "be", "been", "have", "has", "had", "do", "does", "did", "will", "would", "could", "should"}
-    tokens = re.findall(r'\b[a-zA-Z0-9]+\b', text.lower())
+    stopwords = {
+        "o",
+        "a",
+        "os",
+        "as",
+        "um",
+        "uma",
+        "de",
+        "da",
+        "do",
+        "em",
+        "no",
+        "na",
+        "para",
+        "com",
+        "por",
+        "que",
+        "se",
+        "e",
+        "ou",
+        "mas",
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+    }
+    tokens = re.findall(r"\b[a-zA-Z0-9]+\b", text.lower())
     return [t for t in tokens if t not in stopwords and len(t) > 2]
 
 
 def lexical_search_in_vault(
     query_terms: List[str],
     top_k: int = TOP_K_DEFAULT,
-    vault_root: str = os.environ.get("WIKI_PATH", os.path.expanduser("~/vault/wiki"))
+    vault_root: str = os.environ.get("WIKI_PATH", os.path.expanduser("~/vault/wiki")),
 ) -> List[Dict]:
     """
     Lexical search in .md files under vault/wiki/.
@@ -341,15 +501,19 @@ def lexical_search_in_vault(
 
             # Heuristic: matches / sqrt(word_count) — favors concise documents
             word_count = max(1, len(text.split()))
-            density = matches / (word_count ** 0.5)  # sqrt(word_count) to not over-penalize medium texts
-            scored.append({
-                "filepath": filepath,
-                "matches": matches,
-                "word_count": word_count,
-                "density": density,
-                "title": Path(filepath).stem,
-                "text": text[:2000],  # truncate for return
-            })
+            density = matches / (
+                word_count**0.5
+            )  # sqrt(word_count) to not over-penalize medium texts
+            scored.append(
+                {
+                    "filepath": filepath,
+                    "matches": matches,
+                    "word_count": word_count,
+                    "density": density,
+                    "title": Path(filepath).stem,
+                    "text": text[:2000],  # truncate for return
+                }
+            )
         except Exception:
             continue
 
@@ -362,26 +526,31 @@ def lexical_search_in_vault(
     results = []
     for i, item in enumerate(scored[:top_k]):
         # Simulate a result chunk
-        results.append({
-            "id": f"lexical-{hashlib.md5(item['filepath'].encode()).hexdigest()[:16]}",
-            "score": round(min(1.0, item["density"]), 2),
-            "title": item["title"],
-            "content_preview": _strip_prompt_injection(item["text"][:400]),
-            "source": f"vault-{item['filepath'].replace(vault_root, '').lstrip('/')[:40]}",
-            "tags": ["fallback", "lexical"],
-            "fallback_level": "lexical",
-        })
+        results.append(
+            {
+                "id": f"lexical-{hashlib.md5(item['filepath'].encode()).hexdigest()[:16]}",
+                "score": round(min(1.0, item["density"]), 2),
+                "title": item["title"],
+                "content_preview": _strip_prompt_injection(item["text"][:400]),
+                "source": f"vault-{item['filepath'].replace(vault_root, '').lstrip('/')[:40]}",
+                "tags": ["fallback", "lexical"],
+                "fallback_level": "lexical",
+            }
+        )
 
     if results:
-        print(f"[CE-FALLBACK] Lexical search returned {len(results)} results from vault", file=sys.stderr)
+        print(
+            f"[CE-FALLBACK] Lexical search returned {len(results)} results from vault",
+            file=sys.stderr,
+        )
     return results
 
 
 # ─── Fallback: SQLite Keyword Search ────────────────────────────────────────
 
+
 def sqlite_keyword_search(
-    query_terms: List[str],
-    top_k: int = TOP_K_DEFAULT
+    query_terms: List[str], top_k: int = TOP_K_DEFAULT
 ) -> List[Dict]:
     """
     Search terms in the lineage table (query field) and other state tables.
@@ -407,21 +576,28 @@ def sqlite_keyword_search(
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
-                params + [top_k * 2]
+                params + [top_k * 2],
             )
             for row in c.fetchall():
-                results.append({
-                    "id": f"sqlite-{row['lineage_id'][:16]}",
-                    "score": 0.5,
-                    "title": f"Lineage {row['lineage_id'][:8]}...",
-                    "content_preview": _strip_prompt_injection((row["query"] or "")[:400]),
-                    "source": f"sqlite-history-{row['session_id']}",
-                    "tags": ["fallback", "sqlite"],
-                    "fallback_level": "sqlite",
-                })
+                results.append(
+                    {
+                        "id": f"sqlite-{row['lineage_id'][:16]}",
+                        "score": 0.5,
+                        "title": f"Lineage {row['lineage_id'][:8]}...",
+                        "content_preview": _strip_prompt_injection(
+                            (row["query"] or "")[:400]
+                        ),
+                        "source": f"sqlite-history-{row['session_id']}",
+                        "tags": ["fallback", "sqlite"],
+                        "fallback_level": "sqlite",
+                    }
+                )
 
             if results:
-                print(f"[CE-FALLBACK] SQLite keyword search returned {len(results)} results", file=sys.stderr)
+                print(
+                    f"[CE-FALLBACK] SQLite keyword search returned {len(results)} results",
+                    file=sys.stderr,
+                )
             return results[:top_k]
     except Exception as e:
         print(f"[CE-FALLBACK] SQLite search failed: {e}", file=sys.stderr)
@@ -430,12 +606,13 @@ def sqlite_keyword_search(
 
 # ─── Fallback Wrapper ──────────────────────────────────────────────────────
 
+
 def search_with_fallback(
     dense_vector: Optional[List[float]] = None,
-    sparse_vector: Optional[Tuple[List[int], List[float]]] = None,
+    sparse_vector: Optional[Dict] = None,
     query_text: str = "",
     top_k: int = TOP_K_DEFAULT,
-    score_threshold: float = SCORE_THRESHOLD_DEFAULT
+    score_threshold: float = SCORE_THRESHOLD_DEFAULT,
 ) -> Tuple[List[Dict], str, float, float]:
     """
     4-level fallback cascade:
@@ -443,121 +620,189 @@ def search_with_fallback(
       2. Dense-only — if sparse fails or is None
       3. Lexical-only — if Qdrant goes down (ConnectionError, Timeout)
       4. SQLite keyword — if vault is inaccessible
-    
+
+    ``sparse_vector`` is the pure-Python dict from ``embed_query_sparse``
+    (a legacy (indices, values) tuple is still accepted).
+
     Returns (results, fallback_level, qdrant_latency_ms, fallback_latency_ms).
     """
     fallback_level = "hybrid"
     qdrant_latency_ms = 0.0
     t0 = time.perf_counter()
 
-    # Level 1 or 2: Qdrant (hybrid if sparse available, otherwise dense-only)
-    try:
-        t_q0 = time.perf_counter()
-        if sparse_vector is not None:
-            resp = requests.post(
-                f"{QDRANT_URL}/collections/{COLLECTION}/points/query",
-                headers={"Content-Type": "application/json"},
-                json={
-                    "prefetch": [
-                        {"query": dense_vector, "using": "dense", "limit": top_k * 3},
-                        {"query": {"indices": sparse_vector[0], "values": sparse_vector[1]},
-                         "using": "sparse", "limit": top_k * 3},
-                    ],
-                    "query": {"fusion": "rrf"},
-                    "limit": top_k * 2,
-                    "with_payload": True,
-                },
-                timeout=REQUEST_TIMEOUT + 5,
-            )
-            fallback_level = "hybrid"
-        else:
-            resp = requests.post(
-                f"{QDRANT_URL}/collections/{COLLECTION}/points/query",
-                headers={"Content-Type": "application/json"},
-                json={
-                    "query": dense_vector,
-                    "using": "dense",
-                    "limit": top_k,
-                    "with_payload": True,
-                },
-                timeout=REQUEST_TIMEOUT,
-            )
-            fallback_level = "dense-only"
+    sparse = _normalize_sparse(sparse_vector)
 
-        resp.raise_for_status()
-        qdrant_latency_ms = (time.perf_counter() - t_q0) * 1000
-        data = resp.json()
-        results = []
-        raw_results = data.get("result", {})
-        points = raw_results if isinstance(raw_results, list) else raw_results.get("points", [])
-        for r in points:
-            score = r.get("score", 0)
-            if score < score_threshold:
-                continue
-            payload = r.get("payload", {})
-            results.append({
-                "id": r.get("id", "unknown"),
-                "score": score,
-                "title": payload.get("title", "Untitled"),
-                "content_preview": _strip_prompt_injection((payload.get("text", "") or "")[:400]),
-                "source": payload.get("source", "unknown"),
-                "tags": payload.get("tags", [])
-            })
-
-        if results:
-            fallback_latency_ms = (time.perf_counter() - t0) * 1000
-            return results, fallback_level, qdrant_latency_ms, fallback_latency_ms
-    except requests.exceptions.ConnectionError:
-        print("[CE-FALLBACK] Qdrant unavailable (ConnectionError), falling back to lexical search.", file=sys.stderr)
-    except requests.exceptions.Timeout:
-        print("[CE-FALLBACK] Qdrant timeout, falling back to lexical search.", file=sys.stderr)
-    except Exception as e:
-        # Unexpected Qdrant error (e.g. SparseIndexError, 5xx, etc.)
-        # If sparse_vector existed, it might be a sparse error — try dense-only
-        if sparse_vector is not None and "sparse" in str(e).lower():
-            print(f"[CE-FALLBACK] Sparse index failed ('{e}'), trying dense-only...", file=sys.stderr)
-            try:
-                t_q2 = time.perf_counter()
+    # Level 1 or 2: Qdrant (hybrid if sparse available, otherwise dense-only).
+    # Without a dense vector Qdrant cannot be queried at all — say so explicitly
+    # instead of firing a request with a null query.
+    if dense_vector is None:
+        print(
+            "[CE-ERROR] No dense vector available (remote embedding unavailable) — "
+            "skipping Qdrant, going straight to the lexical/SQLite fallbacks.",
+            file=sys.stderr,
+        )
+    else:
+        try:
+            t_q0 = time.perf_counter()
+            if sparse is not None:
                 resp = requests.post(
-                    f"{QDRANT_URL}/collections/{COLLECTION}/points/search",
+                    f"{QDRANT_URL}/collections/{COLLECTION}/points/query",
                     headers={"Content-Type": "application/json"},
                     json={
-                        "vector": dense_vector,
+                        "prefetch": [
+                            {
+                                "query": dense_vector,
+                                "using": "dense",
+                                "limit": top_k * 3,
+                            },
+                            {
+                                "query": {
+                                    "indices": sparse[0],
+                                    "values": sparse[1],
+                                },
+                                "using": "sparse",
+                                "limit": top_k * 3,
+                            },
+                        ],
+                        "query": {"fusion": "rrf"},
+                        "limit": top_k * 2,
+                        "with_payload": True,
+                    },
+                    timeout=REQUEST_TIMEOUT + 5,
+                )
+                fallback_level = "hybrid"
+            else:
+                resp = requests.post(
+                    f"{QDRANT_URL}/collections/{COLLECTION}/points/query",
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "query": dense_vector,
                         "using": "dense",
                         "limit": top_k,
                         "with_payload": True,
                     },
                     timeout=REQUEST_TIMEOUT,
                 )
-                resp.raise_for_status()
-                qdrant_latency_ms = (time.perf_counter() - t_q2) * 1000
-                data = resp.json()
-                results = []
-                raw_results = data.get("result", {})
-                points = raw_results if isinstance(raw_results, list) else raw_results.get("points", [])
-                for r in points:
-                    score = r.get("score", 0)
-                    if score < score_threshold:
-                        continue
-                    payload = r.get("payload", {})
-                    results.append({
+                fallback_level = "dense-only"
+
+            resp.raise_for_status()
+            qdrant_latency_ms = (time.perf_counter() - t_q0) * 1000
+            data = resp.json()
+            results = []
+            raw_results = data.get("result", {})
+            points = (
+                raw_results
+                if isinstance(raw_results, list)
+                else raw_results.get("points", [])
+            )
+            for r in points:
+                score = r.get("score", 0)
+                if score < score_threshold:
+                    continue
+                payload = r.get("payload", {})
+                results.append(
+                    {
                         "id": r.get("id", "unknown"),
                         "score": score,
                         "title": payload.get("title", "Untitled"),
-                        "content_preview": _strip_prompt_injection((payload.get("text", "") or "")[:400]),
+                        "content_preview": _strip_prompt_injection(
+                            (payload.get("text", "") or "")[:400]
+                        ),
                         "source": payload.get("source", "unknown"),
-                        "tags": payload.get("tags", [])
-                    })
-                if results:
-                    fallback_latency_ms = (time.perf_counter() - t0) * 1000
-                    print("[CE-FALLBACK] Dense-only worked after sparse error.", file=sys.stderr)
-                    return results, "dense-only", qdrant_latency_ms, fallback_latency_ms
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-                print("[CE-FALLBACK] Qdrant also unavailable for dense-only — lexical fallback.", file=sys.stderr)
-            except Exception as e2:
-                print(f"[CE-FALLBACK] Dense-only also failed: {e2}", file=sys.stderr)
-        else:
-            print(f"[CE-FALLBACK] Qdrant general error ({e}), falling back to lexical.", file=sys.stderr)
+                        "tags": payload.get("tags", []),
+                    }
+                )
+
+            if results:
+                fallback_latency_ms = (time.perf_counter() - t0) * 1000
+                return results, fallback_level, qdrant_latency_ms, fallback_latency_ms
+        except requests.exceptions.ConnectionError:
+            print(
+                "[CE-FALLBACK] Qdrant unavailable (ConnectionError), falling back to lexical search.",
+                file=sys.stderr,
+            )
+        except requests.exceptions.Timeout:
+            print(
+                "[CE-FALLBACK] Qdrant timeout, falling back to lexical search.",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            # Unexpected Qdrant error (e.g. SparseIndexError, 5xx, etc.)
+            # If a sparse vector existed, it might be the sparse error — try dense-only
+            if sparse is not None and "sparse" in str(e).lower():
+                print(
+                    f"[CE-FALLBACK] Sparse index failed ('{e}'), trying dense-only...",
+                    file=sys.stderr,
+                )
+                try:
+                    t_q2 = time.perf_counter()
+                    resp = requests.post(
+                        f"{QDRANT_URL}/collections/{COLLECTION}/points/search",
+                        headers={"Content-Type": "application/json"},
+                        json={
+                            "vector": dense_vector,
+                            "using": "dense",
+                            "limit": top_k,
+                            "with_payload": True,
+                        },
+                        timeout=REQUEST_TIMEOUT,
+                    )
+                    resp.raise_for_status()
+                    qdrant_latency_ms = (time.perf_counter() - t_q2) * 1000
+                    data = resp.json()
+                    results = []
+                    raw_results = data.get("result", {})
+                    points = (
+                        raw_results
+                        if isinstance(raw_results, list)
+                        else raw_results.get("points", [])
+                    )
+                    for r in points:
+                        score = r.get("score", 0)
+                        if score < score_threshold:
+                            continue
+                        payload = r.get("payload", {})
+                        results.append(
+                            {
+                                "id": r.get("id", "unknown"),
+                                "score": score,
+                                "title": payload.get("title", "Untitled"),
+                                "content_preview": _strip_prompt_injection(
+                                    (payload.get("text", "") or "")[:400]
+                                ),
+                                "source": payload.get("source", "unknown"),
+                                "tags": payload.get("tags", []),
+                            }
+                        )
+                    if results:
+                        fallback_latency_ms = (time.perf_counter() - t0) * 1000
+                        print(
+                            "[CE-FALLBACK] Dense-only worked after sparse error.",
+                            file=sys.stderr,
+                        )
+                        return (
+                            results,
+                            "dense-only",
+                            qdrant_latency_ms,
+                            fallback_latency_ms,
+                        )
+                except (
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout,
+                ):
+                    print(
+                        "[CE-FALLBACK] Qdrant also unavailable for dense-only — lexical fallback.",
+                        file=sys.stderr,
+                    )
+                except Exception as e2:
+                    print(
+                        f"[CE-FALLBACK] Dense-only also failed: {e2}", file=sys.stderr
+                    )
+            else:
+                print(
+                    f"[CE-FALLBACK] Qdrant general error ({e}), falling back to lexical.",
+                    file=sys.stderr,
+                )
 
     # Level 3: Lexical search in vault
     terms = tokenize_query(query_text)
@@ -624,11 +869,34 @@ def enhance_prompt(
         return ""
 
     # Very short or social query — skip
-    social_keywords = {"hi", "hello", "hey", "yo", "sup", "ok", "thanks", "bye", "okay", "great"}
+    social_keywords = {
+        "hi",
+        "hello",
+        "hey",
+        "yo",
+        "sup",
+        "ok",
+        "thanks",
+        "bye",
+        "okay",
+        "great",
+    }
     if user_message.strip().lower() in social_keywords:
         return ""
 
-    dense_vector = embed_query(user_message)
+    # Dense embedding is remote-only and fails loudly; here we report the reason
+    # explicitly and continue with the designed fallback cascade (never silently
+    # pretend the semantic level worked).
+    try:
+        dense_vector = embed_query(user_message)
+    except Exception as e:
+        print(
+            f"[CE-ERROR] Dense embedding unavailable: {e} — continuing with the "
+            "lexical/SQLite fallback levels.",
+            file=sys.stderr,
+        )
+        dense_vector = None
+
     sparse_vector = None
     if hybrid:
         sparse_vector = embed_query_sparse(user_message)
@@ -639,7 +907,7 @@ def enhance_prompt(
         sparse_vector=sparse_vector,
         query_text=user_message,
         top_k=top_k,
-        score_threshold=score_threshold
+        score_threshold=score_threshold,
     )
 
     # If empty and we had no embedding, try pure lexical
@@ -652,20 +920,28 @@ def enhance_prompt(
 
     if not hits:
         # Emit telemetry even when empty (records that search ran and returned nothing)
-        emit_telemetry({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "session_id": session_id,
-            "query": user_message,
-            "retrieval_mode": fallback_level,
-            "retrieved_chunk_ids": [],
-            "semantic_scores": [],
-            "rerank_scores": [],
-            "final_context_tokens": 0,
-            "fallback_level": {"hybrid": 0, "dense-only": 1, "lexical": 2, "sqlite": 3, "none": -1}.get(fallback_level, -1),
-            "llm_response_quality": None,
-            "qdrant_latency_ms": round(qdrant_latency_ms, 2),
-            "fallback_latency_ms": round(fallback_latency_ms, 2),
-        })
+        emit_telemetry(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "session_id": session_id,
+                "query": user_message,
+                "retrieval_mode": fallback_level,
+                "retrieved_chunk_ids": [],
+                "semantic_scores": [],
+                "rerank_scores": [],
+                "final_context_tokens": 0,
+                "fallback_level": {
+                    "hybrid": 0,
+                    "dense-only": 1,
+                    "lexical": 2,
+                    "sqlite": 3,
+                    "none": -1,
+                }.get(fallback_level, -1),
+                "llm_response_quality": None,
+                "qdrant_latency_ms": round(qdrant_latency_ms, 2),
+                "fallback_latency_ms": round(fallback_latency_ms, 2),
+            }
+        )
         return ""
 
     # Update last_accessed_at for returned chunks (reset decay on real usage)
@@ -676,7 +952,9 @@ def enhance_prompt(
         lines = ["\n## Relevant Context from Vault\n"]
         for i, h in enumerate(hits, 1):
             lines.append(f"### [{i}] {h['title']} (score: {h['score']:.2f})")
-            lines.append(f"- **Source:** `{h['source']}` | Tags: {', '.join(str(t) for t in h['tags'])}")
+            lines.append(
+                f"- **Source:** `{h['source']}` | Tags: {', '.join(str(t) for t in h['tags'])}"
+            )
             lines.append(f"- **Excerpt:** {h['content_preview']}...")
             lines.append("")
         context_str = "\n".join(lines)
@@ -688,7 +966,9 @@ def enhance_prompt(
     else:
         context_str = json.dumps(hits, indent=2, ensure_ascii=False)
 
-    generation_context_hash = hashlib.sha256(context_str.encode("utf-8")).hexdigest()[:32]
+    generation_context_hash = hashlib.sha256(context_str.encode("utf-8")).hexdigest()[
+        :32
+    ]
 
     register_lineage(
         session_id=session_id,
@@ -705,32 +985,61 @@ def enhance_prompt(
 
     final_context_tokens = estimate_tokens(context_str)
 
-    emit_telemetry({
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "session_id": session_id,
-        "query": user_message,
-        "retrieval_mode": fallback_level,
-        "retrieved_chunk_ids": retrieved_chunk_ids,
-        "semantic_scores": semantic_scores,
-        "rerank_scores": rerank_scores,
-        "final_context_tokens": final_context_tokens,
-        "fallback_level": {"hybrid": 0, "dense-only": 1, "lexical": 2, "sqlite": 3, "none": -1}.get(fallback_level, -1),
-        "llm_response_quality": None,
-        "qdrant_latency_ms": round(qdrant_latency_ms, 2),
-        "fallback_latency_ms": round(fallback_latency_ms, 2),
-    })
+    emit_telemetry(
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "session_id": session_id,
+            "query": user_message,
+            "retrieval_mode": fallback_level,
+            "retrieved_chunk_ids": retrieved_chunk_ids,
+            "semantic_scores": semantic_scores,
+            "rerank_scores": rerank_scores,
+            "final_context_tokens": final_context_tokens,
+            "fallback_level": {
+                "hybrid": 0,
+                "dense-only": 1,
+                "lexical": 2,
+                "sqlite": 3,
+                "none": -1,
+            }.get(fallback_level, -1),
+            "llm_response_quality": None,
+            "qdrant_latency_ms": round(qdrant_latency_ms, 2),
+            "fallback_latency_ms": round(fallback_latency_ms, 2),
+        }
+    )
 
     return context_str
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Context Enhancer — Hybrid search in knowledge_base")
+    parser = argparse.ArgumentParser(
+        description="Context Enhancer — Hybrid search in knowledge_base"
+    )
     parser.add_argument("query", nargs="?", help="User message/query")
-    parser.add_argument("--top-k", type=int, default=TOP_K_DEFAULT, help=f"Number of results (default: {TOP_K_DEFAULT})")
-    parser.add_argument("--threshold", type=float, default=SCORE_THRESHOLD_DEFAULT, help=f"Minimum score (default: {SCORE_THRESHOLD_DEFAULT})")
-    parser.add_argument("--format", choices=["markdown", "compact", "json"], default="markdown", help="Output format")
-    parser.add_argument("--silent", action="store_true", help="Silent — return empty on error")
-    parser.add_argument("--hybrid-off", action="store_true", help="Force dense-only (ignore BM25)")
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=TOP_K_DEFAULT,
+        help=f"Number of results (default: {TOP_K_DEFAULT})",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=SCORE_THRESHOLD_DEFAULT,
+        help=f"Minimum score (default: {SCORE_THRESHOLD_DEFAULT})",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["markdown", "compact", "json"],
+        default="markdown",
+        help="Output format",
+    )
+    parser.add_argument(
+        "--silent", action="store_true", help="Silent — return empty on error"
+    )
+    parser.add_argument(
+        "--hybrid-off", action="store_true", help="Force dense-only (ignore BM25)"
+    )
     args = parser.parse_args()
 
     if not args.query:
@@ -750,6 +1059,7 @@ def main():
         if not args.silent:
             print(f"[CE-ERROR] {e}", file=sys.stderr)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

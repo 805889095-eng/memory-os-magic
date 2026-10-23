@@ -36,21 +36,24 @@ import argparse
 import hashlib
 import json
 import os
-import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
 # ─── Config ──────────────────────────────────────────────────────────────────
-QDRANT_URL = "http://localhost:6333"
-COLLECTION = "knowledge_base"
+QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
+COLLECTION = os.environ.get("QDRANT_COLLECTION", "knowledge_base")
 BATCH_SIZE = 200
 SCROLL_LIMIT = 200
-LOG_FILE = Path.home() / ".hermes/logs/decay_scanner.log"
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+LOG_FILE = HERMES_HOME / "logs" / "decay_scanner.log"
 VAULT_ROOT = Path(os.environ.get("VAULT_PATH", str(Path.home() / "vault")))
+WIKI_ROOT = Path(os.environ.get("WIKI_ROOT", str(VAULT_ROOT / "wiki")))
+CONTAINER_WIKI_PREFIX = os.environ.get("CONTAINER_WIKI_PREFIX", "/wiki/")
 
 # ─── Heuristics ──────────────────────────────────────────────────────────────
 CONFIDENCE_BY_SOURCE = {
@@ -103,12 +106,27 @@ def scroll_all() -> list[dict]:
     return points
 
 
-def resolve_timestamp(point: dict) -> str:
-    """Return ISO 8601 string for created_at/last_accessed_at.
+def _host_path(raw_path: str) -> Path:
+    """Map a container path (``/wiki/...``) onto the host wiki root.
+
+    Worker payloads store ``/wiki/<rel>``; on the host the same file lives under
+    ``WIKI_ROOT``. Absolute host paths are returned unchanged.
+    """
+    if raw_path.startswith(CONTAINER_WIKI_PREFIX):
+        rel = raw_path[len(CONTAINER_WIKI_PREFIX) :]
+        return WIKI_ROOT / rel
+    return Path(raw_path)
+
+
+def resolve_timestamp(point: dict) -> Optional[str]:
+    """Return an ISO 8601 string for created_at/last_accessed_at, or ``None``.
 
     Session points: use payload.timestamp (Unix epoch float).
-    Wiki points: locate file via payload.file_path → file mtime.
-    Fallback: now().
+    Wiki points: locate the file via payload.source_file / payload.file_path
+    (a container path such as ``/wiki/...``) and use the host mtime.
+
+    ``None`` means "cannot be resolved": the caller MUST skip the point instead
+    of fabricating ``created_at = now()`` (the old silent-fallback bug).
     """
     pl = point.get("payload", {})
     ts_raw = pl.get("timestamp")
@@ -120,19 +138,22 @@ def resolve_timestamp(point: dict) -> str:
         except (ValueError, TypeError, OSError):
             pass
 
-    # Wiki point — resolve file_path to filesystem
-    file_path = pl.get("file_path", "")
-    source = pl.get("source", "")
-    if file_path and source.startswith("wiki-"):
-        candidate = Path(file_path)
+    # Wiki point — resolve source_file / file_path (container path) to host FS
+    raw_path = pl.get("source_file") or pl.get("file_path") or ""
+    source = str(pl.get("source", ""))
+    if raw_path and (
+        source.startswith("wiki-") or raw_path.startswith(CONTAINER_WIKI_PREFIX)
+    ):
+        candidate = _host_path(raw_path)
         try:
             mtime = candidate.stat().st_mtime
             return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
-        except OSError:
-            pass
+        except OSError as e:
+            log(f"  SKIP (unresolvable file): {raw_path} — {e}")
+            return None
 
-    # Absolute fallback
-    return datetime.now(timezone.utc).isoformat()
+    # Cannot resolve → caller skips (never fabricate a timestamp)
+    return None
 
 
 def compute_confidence(point: dict) -> float:
@@ -143,14 +164,19 @@ def compute_confidence(point: dict) -> float:
 
 def needs_backfill(point: dict) -> list[str]:
     """Return list of fields this point is missing (that we backfill)."""
-    TARGETS = ["created_at", "last_accessed_at", "importance_score", "confidence_score", "archived"]
+    TARGETS = [
+        "created_at",
+        "last_accessed_at",
+        "importance_score",
+        "confidence_score",
+        "archived",
+    ]
     pl = point.get("payload", {})
     return [f for f in TARGETS if f not in pl]
 
 
-def build_payload(point: dict) -> dict:
+def build_payload(point: dict, ts: str) -> dict:
     """Build the payload fragment to backfill for this point."""
-    ts = resolve_timestamp(point)
     return {
         "created_at": ts,
         "last_accessed_at": ts,
@@ -193,6 +219,7 @@ def run(dry_run: bool = True, pilot: int = 0, commit: bool = False):
     # ── Identify points needing backfill ──
     to_update: list[tuple[str, dict]] = []  # (point_id, payload_fragment)
     skipped_already_have = 0
+    skipped_unresolved = 0
     stats_by_source = {}
 
     for p in all_points:
@@ -200,14 +227,24 @@ def run(dry_run: bool = True, pilot: int = 0, commit: bool = False):
         if not missing:
             skipped_already_have += 1
             continue
+        ts = resolve_timestamp(p)
+        if ts is None:
+            # Container path not resolvable on the host — skip the point instead
+            # of fabricating created_at = now() (old silent-fallback bug).
+            skipped_unresolved += 1
+            continue
         pid = str(p["id"])
-        pl = build_payload(p)
+        pl = build_payload(p, ts)
         to_update.append((pid, pl))
         src = p.get("payload", {}).get("source", "unknown")
         stats_by_source[src] = stats_by_source.get(src, 0) + 1
 
-    log(f"Points needing backfill: {len(to_update)}/{total}")
+    processed = len(to_update)
+    skipped = skipped_already_have + skipped_unresolved
+
+    log(f"Points needing backfill: {processed}/{total}")
     log(f"Points already complete: {skipped_already_have}")
+    log(f"Points skipped (unresolvable timestamp): {skipped_unresolved}")
 
     if pilot and pilot < len(to_update):
         to_update = to_update[:pilot]
@@ -226,7 +263,10 @@ def run(dry_run: bool = True, pilot: int = 0, commit: bool = False):
         log(f"  {src:<25} {count:>6} pts  ts_sample={ts_sample}")
 
     if dry_run:
-        log("DRY-RUN complete. No changes made. Use --commit to apply.")
+        log(
+            f"DRY-RUN complete. processed={processed} skipped={skipped} failed=0 "
+            "(no changes made; use --commit to apply)."
+        )
         return
 
     # ── Commit ──
@@ -265,19 +305,27 @@ def run(dry_run: bool = True, pilot: int = 0, commit: bool = False):
         if i + BATCH_SIZE < len(to_update):
             time.sleep(0.5)  # gentle rate limit
 
-    log(f"COMMIT complete. success={success}, failed={failed}")
+    log(f"COMMIT complete. processed={success} skipped={skipped} failed={failed}")
     if failed > 0:
         log("WARNING: some batches failed. Check logs.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Backfill decay metadata for Qdrant knowledge_base")
-    parser.add_argument("--dry-run", action="store_true", default=True,
-                        help="Simulate, no writes (default)")
-    parser.add_argument("--commit", action="store_true",
-                        help="Actually write to Qdrant")
-    parser.add_argument("--pilot", type=int, default=0,
-                        help="Process only N points (for validation)")
+    parser = argparse.ArgumentParser(
+        description="Backfill decay metadata for Qdrant knowledge_base"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=True,
+        help="Simulate, no writes (default)",
+    )
+    parser.add_argument(
+        "--commit", action="store_true", help="Actually write to Qdrant"
+    )
+    parser.add_argument(
+        "--pilot", type=int, default=0, help="Process only N points (for validation)"
+    )
     args = parser.parse_args()
 
     if args.commit:

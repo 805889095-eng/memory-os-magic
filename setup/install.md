@@ -9,7 +9,7 @@
 - Hermes Agent 0.14.0+ (tested on 0.15.2)
 - Python 3.11+
 - Docker 24.0+
-- OpenRouter API key **only if using OpenRouter as embedding backend** (Ollama/vLLM/llama.cpp local providers do not require a key — see [Layer 5: Qdrant](../layers/05-qdrant.md))
+- **A remote Embedding endpoint and a remote LLM endpoint, each with its base_url + api_key** — required. There is no offline path: `EMBEDDING_API_KEY` / `LLM_API_KEY` are mandatory, and a missing key is a hard error, never a silent fallback. See [Layer 5: Qdrant](../layers/05-qdrant.md)
 - 16 GB RAM recommended (8 GB minimum)
 
 ## Installation
@@ -93,11 +93,19 @@ cd /path/to/memory-os/docker
 
 # Create .env with required variables
 cat > .env << EOF
-# Required only for OpenRouter embedding backend; safe to leave empty for local providers
-OPENROUTER_API_KEY=sk-or-...
+# Required: the remote embedding + LLM endpoints (OpenAI-compatible, base_url + api_key)
+EMBEDDING_API_BASE=https://openrouter.ai/api/v1
+EMBEDDING_MODEL=qwen/qwen3-embedding-8b
+EMBEDDING_API_KEY=sk-or-...
+LLM_API_BASE=https://openrouter.ai/api/v1
+LLM_MODEL=deepseek/deepseek-chat
+LLM_API_KEY=sk-or-...
 REDIS_PASSWORD=$(openssl rand -hex 16)
 # Optional overrides (defaults shown)
+OPENROUTER_API_KEY=sk-or-...          # fallback for both endpoints when the keys above are empty
 EMBEDDING_DIMS=4096
+ARQ_MAX_TRIES=3
+HERMES_DLQ_PATH=/hermes/wiki_ingest_failures.json
 COLLECTION_NAME=knowledge_base
 LOG_LEVEL=INFO
 EOF
@@ -132,22 +140,30 @@ Add to your Hermes profile `.env` (e.g. `~/.hermes/.env`):
 # Required
 FABRIC_DIR=/home/your-user/vault/fabric
 
-# Required only when using OpenRouter as embedding backend
-OPENROUTER_API_KEY=sk-or-...
+# Required — remote embedding endpoint (base_url + api_key). No offline path:
+# a missing key is a hard error, never a silent fallback.
+EMBEDDING_API_BASE=https://openrouter.ai/api/v1
+EMBEDDING_MODEL=qwen/qwen3-embedding-8b
+EMBEDDING_API_KEY=sk-or-...
+EMBEDDING_DIMS=4096
+
+# Required — remote LLM endpoint used by the ARQ worker for wiki extraction
+# and reflection (OpenAI-compatible chat completions).
+LLM_API_BASE=https://openrouter.ai/api/v1
+LLM_MODEL=deepseek/deepseek-chat
+LLM_API_KEY=sk-or-...
 
 # Strongly recommended
 ICARUS_EXTRACTION_MAX_TOKENS=4096
-ICARUS_EXTRACTION_MODEL=deepseek/deepseek-v4-flash
-EMBEDDING_DIMS=4096
+ICARUS_EXTRACTION_MODEL=deepseek/deepseek-chat
 
-# Optional — Embedding backend (defaults to OpenRouter)
-# EMBEDDING_API_BASE=https://openrouter.ai/api/v1
-# EMBEDDING_MODEL=qwen/qwen3-embedding-8b
+# ARQ worker resilience
+ARQ_MAX_TRIES=3
+HERMES_DLQ_PATH=/home/your-user/.hermes/wiki_ingest_failures.json
 
-# Optional — API key for non-OpenRouter authenticated embedding endpoints
-# (vLLM with --api-key, custom hosted services). Not needed for OpenRouter
-# or local unauthenticated providers.
-# EMBEDDING_API_KEY=your-key-here
+# OpenRouter compatibility: when EMBEDDING_API_BASE / LLM_API_BASE contains
+# "openrouter" and the matching *_API_KEY is empty, OPENROUTER_API_KEY is used.
+# OPENROUTER_API_KEY=sk-or-...
 
 # Optional
 ICARUS_OBSIDIAN=1
@@ -217,75 +233,48 @@ core functionality.
 ### 8. Maintenance Scripts
 
 The `scripts/` directory in this repository contains the maintenance tools
-that keep the memory stack healthy. Copy them to a location of your choice
-(e.g. `~/memory-os-scripts/`) and schedule them.
+that keep the memory stack healthy. `setup.sh` installs the scheduled jobs for
+you (Phase 7b); they live inside an idempotent crontab block, so re-running the
+installer never duplicates an entry.
+
+**Scheduled jobs (installed by `setup.sh`):**
 
 | Script | Schedule | Purpose |
 |---|---|---|
 | `wiki_continuous_ingest.py` | Hourly | Detects new/modified .md files and enqueues them to the ARQ worker |
-| `decay_scanner.py` | Weekly (Sun 3am) | Archives low-importance chunks based on age and importance_score |
-| `dlq_manager.py` | Every 6 hours | Reads, classifies, and reports dead letter queue failures |
-| `semantic_dedup.py` | Monthly (1st Sun) | Scans for near-duplicate vectors (cosine > 0.92) |
-| `backfill_decay_metadata.py` | One-shot / on-demand | Populates missing metadata (created_at, importance_score) for decay scanner |
-| `pre_validator.py` | On-demand | Semantic linter — queries knowledge_base before I/O actions |
-| `reflection_trigger.py` | Every 5 min | Triggers micro_reflection when ARQ worker is idle |
-| `bulk_wiki_ingest.py` | One-shot | Initial bulk ingestion of existing wiki content |
-| `holographic-memory-backup.py` | Weekly (Mon 4am) | Dump and compress `memory_store.db` to backup directory |
-| `wiki-raw-ingest-monitor.py` | Twice/week (Mon/Thu 3am) | Detects new or drifted files in `raw/` vs FTS5 index |
-| `maas-heartbeat.py` | Every 6 hours | Health-check ping against Qdrant, Redis, and ARQ queue depth |
+| `reflection_trigger.py` | Every 5 min | Triggers micro_reflection when the ARQ worker is idle |
+| `decay_scanner.py` | Weekly (Sun 03:00) | Archives low-importance chunks based on age and importance_score |
+| `semantic_dedup.py` | Monthly (1st 03:00) | Scans for near-duplicate vectors (cosine > 0.92) |
+| `dlq_manager.py --report` | Every 2 hours | Reads, classifies, and reports dead letter queue failures |
+| `icarus/evolution.py --decay 30` | Daily 03:30 | Decays `trust_score` of facts unused for ≥30 days (forgetting half of the self-evolution loop) |
 
-**Using Hermes cron (recommended):**
+**On-demand / one-shot helpers (not scheduled):**
+
+| Script | Purpose |
+|---|---|
+| `backfill_decay_metadata.py` | Populates missing metadata (created_at, last_accessed_at, importance_score, confidence_score) for the decay scanner — run once before enabling decay |
+| `bulk_wiki_ingest.py` | One-shot bulk ingestion of all existing wiki content into `knowledge_base` |
+| `pre_validator.py` | Semantic decision linter — queries `knowledge_base` before I/O or API actions |
+| `test_ingestion.py` | End-to-end ingestion test (enqueue → worker → embedding → Qdrant upsert) |
+| `verify_soul_config.py` | Checks that SOUL.md has the Memory OS Ground Truth hierarchy |
+
+`bm25_tf.py` and `context_enhancer.py` are library modules used by the pipeline, not standalone jobs.
+
+**Manual crontab (equivalent to what `setup.sh` installs):**
 
 ```bash
-hermes cron create \
-  --name "wiki-continuous-ingest" \
-  --schedule "0 * * * *" \
-  --script /path/to/scripts/wiki_continuous_ingest.py \
-  --no-agent \
-  --deliver local
-
-hermes cron create \
-  --name "decay-scanner" \
-  --schedule "0 3 * * 0" \
-  --script /path/to/scripts/decay_scanner.py \
-  --no-agent \
-  --deliver local
-
-hermes cron create \
-  --name "dlq-manager" \
-  --schedule "0 */6 * * *" \
-  --script /path/to/scripts/dlq_manager.py \
-  --no-agent \
-  --deliver local
-
-hermes cron create \
-  --name "semantic-dedup" \
-  --schedule "0 3 1 * *" \
-  --script /path/to/scripts/semantic_dedup.py \
-  --no-agent \
-  --deliver local
-
-hermes cron create \
-  --name "holographic-memory-backup" \
-  --schedule "0 4 * * 1" \
-  --script /path/to/scripts/holographic-memory-backup.py \
-  --no-agent \
-  --deliver local
-
-hermes cron create \
-  --name "wiki-raw-ingest-monitor" \
-  --schedule "0 3 * * 1,4" \
-  --script /path/to/scripts/wiki-raw-ingest-monitor.py \
-  --no-agent \
-  --deliver local
-
-hermes cron create \
-  --name "maas-heartbeat" \
-  --schedule "0 */6 * * *" \
-  --script /path/to/scripts/maas-heartbeat.py \
-  --no-agent \
-  --deliver local
+# >>> memory-os scheduler >>>
+0 * * * *    cd /path/to/memory-os && HERMES_HOME=$HOME/.hermes python3 scripts/wiki_continuous_ingest.py >> $HOME/.hermes/logs/wiki-ingest.log 2>&1
+*/5 * * * *  cd /path/to/memory-os && HERMES_HOME=$HOME/.hermes python3 scripts/reflection_trigger.py     >> $HOME/.hermes/logs/reflection_trigger.log 2>&1
+0 3 * * 0    cd /path/to/memory-os && HERMES_HOME=$HOME/.hermes python3 scripts/decay_scanner.py         >> $HOME/.hermes/logs/decay_scanner.log 2>&1
+0 3 1 * *    cd /path/to/memory-os && HERMES_HOME=$HOME/.hermes python3 scripts/semantic_dedup.py        >> $HOME/.hermes/logs/semantic_dedup.log 2>&1
+0 */2 * * *  cd /path/to/memory-os && HERMES_HOME=$HOME/.hermes python3 scripts/dlq_manager.py --report  >> $HOME/.hermes/logs/dlq_manager.log 2>&1
+30 3 * * *   cd /path/to/memory-os && HERMES_HOME=$HOME/.hermes python3 icarus/evolution.py --decay 30   >> $HOME/.hermes/logs/fact_decay.log 2>&1
+# <<< memory-os scheduler <<<
 ```
+
+On platforms without `crontab` (Windows / git-bash) `setup.sh` skips this step with a
+warning instead of failing — schedule the six scripts with your OS task scheduler.
 
 **Before enabling decay scanner:** run `backfill_decay_metadata.py` once to
 populate `created_at`, `last_accessed_at`, `importance_score`, and

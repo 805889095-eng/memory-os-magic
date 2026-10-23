@@ -19,6 +19,8 @@ provides_tools:
   - fabric_telemetry
   - fabric_init_obsidian
   - fabric_report
+  - fact_feedback
+  - memory_evolution_stats
 provides_hooks:
   - on_session_start
   - pre_llm_call

@@ -3,6 +3,7 @@ Tasks — File-based wiki ingestion (Phase B: continuous).
 Receives a file path to a .md file inside the container (e.g. /wiki/concepts/new.md),
 extracts frontmatter, generates DENSE + BM25 SPARSE embeddings, upserts into the configured collection.
 """
+
 import logging
 import os
 import uuid
@@ -19,7 +20,7 @@ from services.sparse_embedding import get_sparse_embedding
 logger = logging.getLogger("cognitive-worker.file_ingest")
 
 COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "knowledge_base")
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "qdrant-maas")
+QDRANT_HOST = os.environ.get("QDRANT_HOST", "qdrant")
 QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
 WIKI_PATH = os.environ.get("WIKI_PATH", "/wiki")
 MAX_TEXT_LEN = 8000
@@ -32,6 +33,7 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
         if len(parts) >= 3:
             try:
                 import yaml
+
                 meta = yaml.safe_load(parts[1])
                 body = parts[2].strip()
                 return (meta if isinstance(meta, dict) else {}), body
@@ -97,11 +99,21 @@ async def upsert_with_dedup(
                 st_priority = {"human": 3, "procedural": 2, "ai": 1}
                 existing_st = existing_payload.get("source_type", "ai")
                 new_st = payload.get("source_type", "ai")
-                merged_st = existing_st if st_priority.get(existing_st, 0) >= st_priority.get(new_st, 0) else new_st
+                merged_st = (
+                    existing_st
+                    if st_priority.get(existing_st, 0) >= st_priority.get(new_st, 0)
+                    else new_st
+                )
                 # Merge: last_accessed_at (max)
-                existing_la = existing_payload.get("last_accessed_at", payload.get("created_at"))
+                existing_la = existing_payload.get(
+                    "last_accessed_at", payload.get("created_at")
+                )
                 new_la = payload.get("last_accessed_at")
-                merged_la = max(existing_la, new_la) if existing_la and new_la else (existing_la or new_la)
+                merged_la = (
+                    max(existing_la, new_la)
+                    if existing_la and new_la
+                    else (existing_la or new_la)
+                )
                 # Merge: importance_score (max)
                 existing_imp = existing_payload.get("importance_score", 0.5)
                 new_imp = payload.get("importance_score", 0.5)
@@ -126,7 +138,9 @@ async def upsert_with_dedup(
                     },
                     points=[hit_id],
                 )
-                logger.info(f"Dedup: merged into chunk {hit_id} (score={hit_score:.3f})")
+                logger.info(
+                    f"Dedup: merged into chunk {hit_id} (score={hit_score:.3f})"
+                )
                 return {
                     "status": "dedup",
                     "existing_id": str(hit_id),
@@ -186,7 +200,7 @@ async def ingest_file(
 
     # Payload
     now = datetime.now(timezone.utc).isoformat()
-    
+
     # Heuristic importance_score based on file path/name
     importance_score = 0.5  # default
     path_str_lower = str(path).lower()
@@ -196,7 +210,7 @@ async def ingest_file(
         importance_score = 0.8
     if any(k in path_str_lower for k in ["draft", "temp", "old"]):
         importance_score = 0.2
-    
+
     payload = {
         "text": embed_text,
         "source": source,
@@ -204,12 +218,12 @@ async def ingest_file(
         "created_at": now,
         "reflection_count": 0,
         "last_reflected": None,
-        "file_path": str(path),
+        "source_file": str(path),
         "title": title,
         "word_count": len(embed_text.split()),
         # ── Lineage fields (Phase 1) ──
-        "lineage_id": None,       # legacy: last lineage that generated this chunk
-        "lineage_ids": [],        # Phase 3.5: all accumulated lineages (merge)
+        "lineage_id": None,  # legacy: last lineage that generated this chunk
+        "lineage_ids": [],  # Phase 3.5: all accumulated lineages (merge)
         "generation_model": None,
         "generation_context_hash": None,
         "retrieved_chunk_ids": None,
@@ -233,7 +247,9 @@ async def ingest_file(
     )
 
     if result["status"] == "dedup":
-        logger.info(f"File {path.name} deduplicated (merged into {result['existing_id']}) — similarity {result['similarity']:.3f}")
+        logger.info(
+            f"File {path.name} deduplicated (merged into {result['existing_id']}) — similarity {result['similarity']:.3f}"
+        )
     else:
         logger.info(f"File {path.name} ingested ({source}) — dense+sparse")
 

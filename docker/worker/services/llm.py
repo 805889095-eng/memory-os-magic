@@ -1,6 +1,10 @@
 """
-LLM client via native Ollama.
+LLM client — remote OpenAI-compatible ``/chat/completions``.
+
+Remote-only: there is no local inference backend. All generation is a remote
+HTTP call to ``POST {LLM_API_BASE}/chat/completions``.
 """
+
 import os
 import logging
 
@@ -8,50 +12,80 @@ import httpx
 
 logger = logging.getLogger("cognitive-worker.llm")
 
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "deepseek-v4-flash:cloud")
-OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
+LLM_API_BASE = os.environ.get("LLM_API_BASE", "https://openrouter.ai/api/v1")
+LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek/deepseek-chat")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+
+DEEPSEEK_API_BASE = "https://api.deepseek.com/v1"
 
 
-def get_auth_header() -> dict:
-    """Returns auth header if API key is configured."""
-    if OLLAMA_API_KEY:
-        return {"Authorization": f"Bearer {OLLAMA_API_KEY}"}
-    return {}
-
-
-async def ollama_chat(prompt: str, model: str | None = None, timeout: int = 120) -> str:
+def _resolve_backend() -> tuple:
     """
-    Sends a prompt to native Ollama and returns the response.
-    Uses cloud models like deepseek-v4-flash:cloud.
+    Resolve ``(base_url, api_key, model)`` for the remote chat endpoint.
+
+    Fallback order (contract section 3):
+      1. ``LLM_API_KEY`` on ``LLM_API_BASE``
+      2. ``OPENROUTER_API_KEY`` when the base points at OpenRouter
+      3. ``DEEPSEEK_API_KEY`` with base ``https://api.deepseek.com/v1``
+
+    A missing key raises explicitly — never a silent unauthenticated request.
     """
-    model = model or OLLAMA_MODEL
-    url = f"{OLLAMA_BASE_URL}/api/generate"
+    if LLM_API_KEY:
+        return LLM_API_BASE, LLM_API_KEY, LLM_MODEL
+    if "openrouter" in LLM_API_BASE.lower() and OPENROUTER_API_KEY:
+        return LLM_API_BASE, OPENROUTER_API_KEY, LLM_MODEL
+    if DEEPSEEK_API_KEY:
+        return DEEPSEEK_API_BASE, DEEPSEEK_API_KEY, LLM_MODEL
+    raise RuntimeError(
+        "LLM_API_KEY is required. Fallbacks: OPENROUTER_API_KEY (when "
+        "LLM_API_BASE points at OpenRouter) or DEEPSEEK_API_KEY. "
+        "No API key is configured."
+    )
+
+
+async def chat_completion(
+    prompt: str,
+    model: str | None = None,
+    timeout: int = 120,
+) -> str:
+    """
+    Sends a prompt to a remote OpenAI-compatible ``/chat/completions`` endpoint
+    and returns ``choices[0].message.content``.
+    """
+    base_url, api_key, default_model = _resolve_backend()
+    model = model or default_model
 
     headers = {
         "Content-Type": "application/json",
-        **get_auth_header(),
+        "Authorization": f"Bearer {api_key}",
     }
-
     payload = {
         "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0.7,
-            "num_predict": 4096,  # DeepSeek generates long reasoning; needs space
-        },
+        "messages": [{"role": "user", "content": prompt}],
     }
 
     async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(url, headers=headers, json=payload)
+        resp = await client.post(
+            f"{base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+        )
         resp.raise_for_status()
         data = resp.json()
 
-    # DeepSeek v4 flash: reasoning can consume tokens, leaving response empty
-    # Return reasoning if content is empty
-    response = data.get("response", "")
-    if not response and "reasoning" in data:
-        response = data["reasoning"]
-    
-    return response
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"LLM returned no choices: {str(data)[:200]}")
+
+    message = choices[0].get("message") or {}
+    return message.get("content") or ""
+
+
+# ─── Backwards-compatible alias ─────────────────────────────────────────────
+# Legacy chat-helper name retained on purpose (contract section 3): existing
+# callers that import it keep working, and it points at the remote
+# OpenAI-compatible implementation above. Contract-mandated, do not remove.
+ollama_chat = chat_completion

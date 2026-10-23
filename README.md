@@ -9,7 +9,7 @@ Seven memory layers. Automatic, intelligent context injection. Structured facts 
 
 Memory OS turns Hermes Agent into a real long-term collaborator — one that remembers your projects, your decisions, your reasoning, and brings exactly the right context back at exactly the right moment. Like talking to a colleague who was there for every session.
 
-**Memory infrastructure runs entirely on your machine. Works with any LLM provider — OpenRouter, OpenAI, Anthropic, Ollama, or local models. No memory subscription. No vendor lock-in.**
+**Memory infrastructure runs entirely on your machine. Works with any remote LLM provider — OpenRouter, OpenAI, Anthropic, DeepSeek, or any OpenAI-compatible endpoint. Remote-only inference: embeddings and generation are remote API calls, and sparse retrieval is pure-Python BM25. No memory subscription. No vendor lock-in.**
 
 ---
 
@@ -45,7 +45,7 @@ Not just another plugin. A complete **memory operating system** — 7 layers wor
 Designed and refined by someone who ran headfirst into every limitation of stock Hermes and every existing memory solution.
 
 **Requirements:** Hermes Agent + Docker (Qdrant + Redis + ARQ Worker) + Python 3.11+.  
-Compatible with any LLM provider Hermes supports — OpenRouter, OpenAI, Anthropic, Ollama, and more.
+Compatible with any remote LLM provider Hermes supports — OpenRouter, OpenAI, Anthropic, DeepSeek, and more. No in-process model runtime is required — embeddings and generation are remote API calls, so there are no model weights to download.
 
 ---
 
@@ -115,6 +115,24 @@ The result: **memory-zero behavior** despite perfect injection. Every rediscover
 
 ---
 
+## Self-evolution: memory that gets sharper the more you use it
+
+Memory OS doesn't just store facts — it *trains* them. Every fact lives in the `facts` table of `memory_store.db` and carries a trust score that moves as the fact proves itself in real conversations:
+
+1. **Write** — facts are recorded with a category and tags and a starting trust of **0.55** (`icarus/evolution.py: record_fact`).
+2. **Retrieve** — every time a fact is injected into the prompt its retrieval counter increments (`record_retrieval`).
+3. **Feedback** — when the assistant's reply actually reuses an injected fact (keyword overlap), it is rewarded automatically (`hooks.py: _auto_feedback`). You can also vote explicitly with the `fact_feedback` tool.
+4. **Trust adjustment** — a helpful fact gains **+0.08** trust per reward (capped at 1.0) and bumps its helpful count; a misleading one loses **0.12** (`apply_feedback`).
+5. **Re-rank & decay** — injection order is recomputed with `rank_score = trust × (1 + 0.15·log1p(retrieval_count)) × exp(−ln2·age_days/180)`, so trusted, frequently-used, recent facts surface first; facts untouched for 30+ days decay by **0.02** per run down to a floor of **0.05** (`decay_unused`).
+
+**Enabling:** no extra configuration — the loop runs automatically whenever the Icarus plugin is active. Facts live in `$HERMES_HOME/memory_store.db` (`facts` + `facts_fts`).
+
+**Observing:** call `memory_evolution_stats()` for a snapshot (total facts, average trust, most-used facts and their rank scores); call `fact_feedback(fact_id=..., helpful=True|False)` to vote on a fact yourself. `python icarus/evolution.py --selftest` verifies the whole loop end to end.
+
+See [Layer 3 — Structured Facts](layers/03-fact-store.md) for the full mechanism.
+
+---
+
 ## Memory OS vs. stock Hermes
 
 | Aspect | Stock Hermes | Memory OS |
@@ -140,7 +158,7 @@ Because almost every modern memory solution is **cloud-first**. If you want real
 |---|---|---|---|---|
 | Local memory infrastructure | ✓ | ✗ | ✗ | ✗ |
 | No memory subscription | ✓ | ✗ | ✗ | ✗ |
-| Provider agnostic (OpenRouter, Ollama…) | ✓ | Partial | Partial | Partial |
+| Provider agnostic (OpenRouter, OpenAI, DeepSeek…) | ✓ | Partial | Partial | Partial |
 | Hermes-native | ✓ | ✗ | ✗ | ✗ |
 | Structured facts + trust scores | ✓ | Partial | ✗ | ✗ |
 | Self-curating wiki | ✓ | ✗ | ✗ | ✗ |

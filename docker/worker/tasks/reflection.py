@@ -2,19 +2,23 @@
 Tasks — Reflection Engine v2.
 Reviews old memories, generates insights, CREATES NEW INDEXABLE POINTS in Qdrant.
 """
-import logging
 import json
+import logging
 import os
+import re
+import sqlite3
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
+import httpx
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import PointStruct, Filter, FieldCondition, Range
 
 # Alias for qdrant_client.models used in Micro Reflection
 import qdrant_client.models as qmodels
 
-from services.llm import ollama_chat
+from services.llm import chat_completion
 from services.embedding import get_embedding
 
 logger = logging.getLogger("cognitive-worker.reflection")
@@ -32,6 +36,67 @@ Memories:
 
 Respond in JSON with keys: patterns, connections, insights, actions.
 """
+
+
+# ─── JSON extraction (brace-balanced) ───────────────────────────────────────
+def _match_brace(text: str, start: int) -> Optional[int]:
+    """
+    Return the index just past the '}' that matches ``text[start] == '{'``,
+    honouring nested braces and braces inside string literals; None if unclosed.
+    """
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return None
+
+
+def _extract_json_object(text: str) -> Optional[dict]:
+    """
+    Extract the first balanced JSON object from an LLM response.
+
+    Handles ```json ... ``` (or bare ```) code fences and objects with nested
+    braces / braces inside strings — unlike the naive ``re.search(r'\\{[^}]*\\}')``
+    it replaces, which truncates at the first '}'. Returns the parsed dict, or
+    None when no valid JSON object is found.
+    """
+    if not text:
+        return None
+
+    candidate = text
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if fence:
+        candidate = fence.group(1)
+
+    start = candidate.find("{")
+    while start != -1:
+        end = _match_brace(candidate, start)
+        if end is not None:
+            try:
+                parsed = json.loads(candidate[start:end])
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                return parsed
+        start = candidate.find("{", start + 1)
+    return None
 
 
 async def reflect_on_memories(qdrant: AsyncQdrantClient) -> dict:
@@ -72,9 +137,12 @@ async def reflect_on_memories(qdrant: AsyncQdrantClient) -> dict:
 
     prompt = REFLECTION_PROMPT.format(memories=memories_text)
 
+    response = ""
     try:
-        response = await ollama_chat(prompt)
-        reflection_data = json.loads(response)
+        response = await chat_completion(prompt)
+        reflection_data = _extract_json_object(response)
+        if reflection_data is None:
+            reflection_data = json.loads(response)
     except json.JSONDecodeError:
         logger.warning("Reflection returned invalid JSON, saving raw")
         reflection_data = {"raw": response}
@@ -157,11 +225,24 @@ Respond in JSON:
 }}
 """
 
-import sqlite3
-import os
-from typing import Optional
 
-STATE_DB_PATH = os.environ.get("STATE_DB_PATH", "/hermes/state.db")
+def _resolve_state_db_path() -> str:
+    """
+    Resolve the reflection-budget state DB path.
+
+    Priority: explicit ``STATE_DB_PATH`` → ``HERMES_HOME/state.db`` →
+    container default ``/hermes/state.db``.
+    """
+    explicit = os.environ.get("STATE_DB_PATH")
+    if explicit:
+        return explicit
+    hermes_home = os.environ.get("HERMES_HOME")
+    if hermes_home:
+        return os.path.join(hermes_home, "state.db")
+    return "/hermes/state.db"
+
+
+STATE_DB_PATH = _resolve_state_db_path()
 
 
 def get_budget_for_hour(hour_window: str) -> int:
@@ -205,18 +286,18 @@ async def micro_reflection(qdrant: AsyncQdrantClient) -> dict:
     """
     now = datetime.now(timezone.utc)
     hour_window = now.strftime("%Y-%m-%dT%H")
-    
+
     # ── Budget check ──────────────────────────────────────────────────────
     max_per_hour = int(os.environ.get("MICRO_REFLECTION_MAX_PER_HOUR", "5"))
     current_count = get_budget_for_hour(hour_window)
-    
+
     if current_count >= max_per_hour:
         logger.info(f"Micro-reflection budget exhausted for {hour_window} ({current_count}/{max_per_hour})")
         return {"status": "budget_exceeded", "processed": 0}
-    
+
     # ── Select chunks ─────────────────────────────────────────────────────
     max_chunks = int(os.environ.get("MICRO_REFLECTION_MAX_CHUNKS", "10"))
-    
+
     filter_chunks = Filter(
         must=[
             FieldCondition(
@@ -229,7 +310,7 @@ async def micro_reflection(qdrant: AsyncQdrantClient) -> dict:
             ),
         ]
     )
-    
+
     try:
         # Order by created_at DESC via scroll (Qdrant has no direct sort; use scroll with limit)
         results = await qdrant.scroll(
@@ -243,25 +324,24 @@ async def micro_reflection(qdrant: AsyncQdrantClient) -> dict:
     except Exception as e:
         logger.warning(f"Error fetching chunks for reflection: {e}")
         return {"status": "error", "error": str(e)}
-    
+
     if not points:
         logger.info("No eligible chunks for micro-reflection")
         return {"status": "no-op", "processed": 0}
-    
+
     processed = 0
     contradictions = 0
     consistencies = 0
-    
+
     for point in points:
         chunk_text = point.payload.get("text", "")
         chunk_id = point.id
-        
+
         if not chunk_text:
             continue
-        
+
         # Fetch similar neighbors via REST API
         try:
-            import httpx
             point_data = await qdrant.retrieve(
                 collection_name=COLLECTION_NAME,
                 ids=[chunk_id],
@@ -270,11 +350,11 @@ async def micro_reflection(qdrant: AsyncQdrantClient) -> dict:
             if not point_data or not point_data[0].vector:
                 logger.warning(f"Could not get vector for chunk {chunk_id}")
                 continue
-            
+
             vector = point_data[0].vector.get("dense") if isinstance(point_data[0].vector, dict) else point_data[0].vector
-            
+
             async with httpx.AsyncClient() as client:
-                qdrant_host = os.environ.get("QDRANT_HOST", "qdrant-maas")
+                qdrant_host = os.environ.get("QDRANT_HOST", "qdrant")
                 qdrant_port = int(os.environ.get("QDRANT_PORT", "6333"))
                 resp = await client.post(
                     f"http://{qdrant_host}:{qdrant_port}/collections/{COLLECTION_NAME}/points/search",
@@ -287,51 +367,53 @@ async def micro_reflection(qdrant: AsyncQdrantClient) -> dict:
                 )
                 resp.raise_for_status()
                 neighbors = resp.json().get("result", [])
-            
+
             # Filter out the chunk itself
             neighbor_texts = []
             for n in neighbors:
                 if n["id"] != chunk_id and n.get("payload", {}).get("text"):
                     neighbor_texts.append(f"[{str(n['id'])[:8]}] {n['payload']['text'][:300]}")
-            
+
             if len(neighbor_texts) < 2:
                 logger.info(f"Chunk {chunk_id[:8]} has too few neighbors, skipping")
                 continue
-            
+
         except Exception as e:
             logger.warning(f"Error fetching neighbors for {chunk_id}: {e}")
             continue
-        
+
         # LLM analysis
         neighbors_text = "\n\n".join(neighbor_texts[:3])
         prompt = MICRO_REFLECTION_PROMPT.format(
             chunk_text=chunk_text[:600],
             neighbors_text=neighbors_text,
         )
-        
+
+        response = ""
+        analysis = None
         try:
-            response = await ollama_chat(prompt)
-            # Extract JSON from response
-            import re
-            json_match = re.search(r'\{[^}]*\}', response)
-            if json_match:
-                analysis = json.loads(json_match.group())
-            else:
+            response = await chat_completion(prompt)
+            # Extract JSON from response (brace-balanced, fence-aware)
+            analysis = _extract_json_object(response)
+            if analysis is None:
                 # Try to parse the whole response
                 analysis = json.loads(response.strip())
         except json.JSONDecodeError:
             logger.warning(f"LLM response is not valid JSON for chunk {chunk_id[:8]}: {response[:100]}")
-            analysis = {"contradiction_found": False, "severity": "low", "explanation": "Could not analyze"}
         except Exception as e:
             logger.warning(f"LLM error for chunk {chunk_id[:8]}: {e}")
             continue
-        
+
+        if not isinstance(analysis, dict):
+            logger.warning(f"LLM analysis is not a JSON object for chunk {chunk_id[:8]}")
+            analysis = {"contradiction_found": False, "severity": "low", "explanation": "Could not analyze"}
+
         # Apply result
         current_confidence = point.payload.get("confidence_score", 1.0)
         contradiction_found = analysis.get("contradiction_found", False)
         severity = analysis.get("severity", "low")
         explanation = analysis.get("explanation", "")
-        
+
         if contradiction_found:
             severity_mult = {"low": 0.05, "medium": 0.1, "high": 0.2}.get(severity, 0.1)
             new_confidence = max(0.0, current_confidence - severity_mult)
@@ -341,7 +423,7 @@ async def micro_reflection(qdrant: AsyncQdrantClient) -> dict:
             new_confidence = min(1.0, current_confidence + 0.05)
             consistencies += 1
             reflection_note = f"[CONSISTENT] {explanation}"
-        
+
         # Update payload in Qdrant
         new_count = point.payload.get("reflection_count", 0) + 1
         try:
@@ -359,12 +441,12 @@ async def micro_reflection(qdrant: AsyncQdrantClient) -> dict:
             logger.info(f"Micro-reflection {chunk_id[:8]}: {reflection_note[:80]}")
         except Exception as e:
             logger.warning(f"Error updating chunk {chunk_id}: {e}")
-    
+
     # Increment budget
     increment_budget(hour_window, tokens_used=0)
-    
+
     logger.info(f"Micro-reflection completed: {processed} chunks, {contradictions} contradictions, {consistencies} consistent")
-    
+
     return {
         "status": "completed",
         "processed": processed,

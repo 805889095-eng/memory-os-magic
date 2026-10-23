@@ -1,35 +1,38 @@
 """Lifecycle hooks — memory capture, decision detection, creative tracking."""
 
+import importlib
 import json
 import logging
 import os
 import re
+import sys
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import state
+from . import evolution
 from . import collapse as _collapse
 
-# ── LLM extraction key ──
 _OPENROUTER_KEY = (
     os.environ.get("OPENROUTER_FULL_API_KEY", "")
     or os.environ.get("OPENROUTER_DS_API_KEY", "")
     or os.environ.get("OPENROUTER_API_KEY", "")
 )
+
 _DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+_LLM_API_BASE = os.environ.get("LLM_API_BASE", "").strip().rstrip("/")
+_LLM_API_KEY = os.environ.get("LLM_API_KEY", "").strip()
+_LLM_MODEL = os.environ.get("LLM_MODEL", "").strip()
 
 # Provider-agnostic endpoint resolution.
 # Consumers call _resolve_llm_endpoint() and _resolve_llm_headers()
 # instead of reading the globals or hardcoding URLs.
-# Priority: 1) ICARUS_ENDPOINT + ICARUS_API_KEY_ENV override,
-#           2) DEEPSEEK_API_KEY → api.deepseek.com,
-#           3) OPENROUTER_API_KEY → openrouter.ai (existing behaviour).
 _ICARUS_ENDPOINT = os.environ.get("ICARUS_ENDPOINT", "").strip().rstrip("/")
 _ICARUS_API_KEY_ENV = os.environ.get("ICARUS_API_KEY_ENV", "").strip()
 
-_EXTRACTION_MODEL = os.environ.get("ICARUS_EXTRACTION_MODEL", "deepseek/deepseek-v4-flash")
+_EXTRACTION_MODEL = _LLM_MODEL or os.environ.get("ICARUS_EXTRACTION_MODEL", "deepseek/deepseek-chat")
 _EXTRACTION_MAX_TOKENS = int(os.environ.get("ICARUS_EXTRACTION_MAX_TOKENS", "1024"))
 
 
@@ -38,11 +41,16 @@ def _resolve_llm_endpoint() -> str:
 
     Priority:
       1. ``ICARUS_ENDPOINT`` env var (fully custom).
-      2. ``api.deepseek.com/v1/chat/completions`` when ``DEEPSEEK_API_KEY`` is set.
-      3. ``https://openrouter.ai/api/v1/chat/completions`` (default / legacy).
+      2. ``LLM_API_BASE`` env var (standard OpenAI-compatible base).
+      3. ``api.deepseek.com/v1/chat/completions`` when ``DEEPSEEK_API_KEY`` is set.
+      4. ``https://openrouter.ai/api/v1/chat/completions`` (default / legacy).
     """
     if _ICARUS_ENDPOINT:
         return _ICARUS_ENDPOINT
+    if _LLM_API_BASE:
+        if _LLM_API_BASE.endswith("/chat/completions"):
+            return _LLM_API_BASE
+        return f"{_LLM_API_BASE}/chat/completions"
     if _DEEPSEEK_KEY:
         return "https://api.deepseek.com/v1/chat/completions"
     return "https://openrouter.ai/api/v1/chat/completions"
@@ -53,13 +61,16 @@ def _resolve_llm_api_key() -> str:
 
     Priority (mirrors _resolve_llm_endpoint):
       1. The env var named by ``ICARUS_API_KEY_ENV``, if set.
-      2. ``DEEPSEEK_API_KEY`` when available.
-      3. ``OPENROUTER_API_KEY`` (default).
+      2. ``LLM_API_KEY`` when available.
+      3. ``DEEPSEEK_API_KEY`` when available.
+      4. ``OPENROUTER_API_KEY`` (default).
     """
     if _ICARUS_API_KEY_ENV:
         custom_key = os.environ.get(_ICARUS_API_KEY_ENV, "")
         if custom_key:
             return custom_key
+    if _LLM_API_KEY:
+        return _LLM_API_KEY
     if _DEEPSEEK_KEY:
         return _DEEPSEEK_KEY
     return _OPENROUTER_KEY
@@ -82,16 +93,18 @@ def _resolve_llm_headers(api_key: str) -> dict:
 def _resolve_llm_model() -> str:
     """Return the model name compatible with the resolved endpoint.
 
-    OpenRouter uses ``provider/model`` slugs (e.g. ``deepseek/deepseek-v4-flash``).
-    Direct API endpoints (DeepSeek, custom) use bare model names.
+    If LLM_MODEL is explicitly provided, use it directly without alteration.
+    Otherwise adapt default OpenRouter slug (e.g. deepseek/deepseek-chat) for direct endpoints.
     """
+    if _LLM_MODEL:
+        return _LLM_MODEL
     model = _EXTRACTION_MODEL
     endpoint = _resolve_llm_endpoint()
-    if "openrouter.ai" not in endpoint and "/" in model:
-        # Strip the provider prefix for direct API calls
+    if "api.deepseek.com" in endpoint and "/" in model:
         _, bare = model.split("/", 1)
         return bare
     return model
+
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +125,7 @@ def _is_system_injection(text):
     stripped = text.strip()
     return any(stripped.startswith(p) for p in _SYSTEM_PREFIXES)
 
+
 # use shared regexes from state for decision/outcome/completion detection
 # keep local regexes only for creative tracking (broader set)
 _THEME_RE = re.compile(
@@ -129,20 +143,83 @@ _STOPWORDS = frozenset(
     "than over such make made most each does done being".split()
 )
 
-# ── Topic overlap tracking ──
-_last_query_tokens: set = set()
+# ── Per-session state (session-isolated) ─────────────────────
+# These structures used to be module-level singletons, so two concurrent
+# sessions sharing one Hermes process clobbered each other: session B's
+# on_session_start wiped session A's dedup sets, and topic-overlap gating
+# compared tokens across unrelated conversations. They are now keyed by
+# session_id with an LRU cap. The hook signatures are unchanged — only the
+# backing storage moved — so no caller/API shape is affected.
+_SESSION_STATE: dict = {}
+_SESSION_STATE_MAX = 64
+_DEFAULT_SESSION_KEY = "__no_session__"
 
-# ── Per-session injection dedup (reset on session start) ──
-_injected_fabric: set = set()
-_injected_qdrant: set = set()
-_injected_sessions: set = set()
+
+def _new_bucket() -> dict:
+    return {
+        "last_query_tokens": set(),
+        "injected_fabric": set(),
+        "injected_qdrant": set(),
+        "injected_sessions": set(),
+        # fact_id -> content, so post_llm_call/on_session_end can score the
+        # facts actually injected this session (and only those).
+        "injected_facts": {},
+    }
+
+
+def _session_bucket(session_id=""):
+    """Return the mutable state bucket for ``session_id`` (LRU-refreshed)."""
+    key = session_id or _DEFAULT_SESSION_KEY
+    bucket = _SESSION_STATE.pop(key, None)
+    if bucket is None:
+        bucket = _new_bucket()
+    _SESSION_STATE[key] = bucket  # re-insert => most-recently-used
+    while len(_SESSION_STATE) > _SESSION_STATE_MAX:
+        oldest = next(iter(_SESSION_STATE))
+        if oldest == key:
+            break
+        _SESSION_STATE.pop(oldest, None)
+    return bucket
+
+
+def _reset_session_bucket(session_id=""):
+    """Drop and recreate the bucket for ``session_id`` (session start)."""
+    _SESSION_STATE.pop(session_id or _DEFAULT_SESSION_KEY, None)
+    return _session_bucket(session_id)
 
 
 def _tokenize(text):
     words = set(re.findall(r"[a-z0-9]+", text.lower()))
-    return words - {"the", "a", "an", "is", "was", "are", "to", "of", "in", "for",
-                    "on", "with", "it", "and", "or", "not", "i", "you", "can", "do",
-                    "this", "that", "what", "how", "please", "help", "me", "my"}
+    return words - {
+        "the",
+        "a",
+        "an",
+        "is",
+        "was",
+        "are",
+        "to",
+        "of",
+        "in",
+        "for",
+        "on",
+        "with",
+        "it",
+        "and",
+        "or",
+        "not",
+        "i",
+        "you",
+        "can",
+        "do",
+        "this",
+        "that",
+        "what",
+        "how",
+        "please",
+        "help",
+        "me",
+        "my",
+    }
 
 
 def _extract_theme(text):
@@ -153,10 +230,10 @@ def _extract_theme(text):
 
 def _sanitize_learning(s: str) -> str:
     """Remove unpaired backticks that would produce orphaned markdown."""
-    if s.count('`') % 2 != 0:
-        s = s.replace('`', '')
-    if s.count('```') % 2 != 0:
-        s = s.replace('```', '')
+    if s.count("`") % 2 != 0:
+        s = s.replace("`", "")
+    if s.count("```") % 2 != 0:
+        s = s.replace("```", "")
     return s.strip()
 
 
@@ -170,16 +247,11 @@ def _extract_sentence(text, pattern):
 
 # ── Hooks ────────────────────────────────────────────────
 
+
 def on_session_start(session_id="", platform="", **kwargs):
     """Load context: SOUL + pending handoffs + recent entries + creative state."""
-    global _last_query_tokens
-    _last_query_tokens = set()
-    _injected_fabric.clear()
-    _injected_qdrant.clear()
-    _injected_sessions.clear()
-    state.session_id = session_id
-    state.exchanges = []
-    state._recall_log = []
+    _reset_session_bucket(session_id)
+    state.bind_session(session_id, reset=True)
 
     creative = state.load_creative()
     creative["cycle"] += 1
@@ -200,7 +272,9 @@ def on_session_start(session_id="", platform="", **kwargs):
             entry_id = t.get("id", "?")
             etype = t.get("type", "task")
             parts.append(f"  - {src}: {t.get('summary', '?')} ({etype}, id {entry_id})")
-        parts.append("  If reviewing, set review_of. If revising, set revises. Otherwise just complete the work.")
+        parts.append(
+            "  If reviewing, set review_of. If revising, set revises. Otherwise just complete the work."
+        )
 
     if reviews:
         parts.append(f"[fabric] {len(reviews)} review(s) of your work:")
@@ -208,8 +282,12 @@ def on_session_start(session_id="", platform="", **kwargs):
             reviewer = r.get("agent", "?")
             entry_id = r.get("id", "?")
             ref = r.get("review_of", "")
-            parts.append(f"  - {reviewer}: {r.get('summary', '?')} (review id {entry_id}, of {ref})")
-        parts.append("  When you fix the issues, set revises to your original entry's agent:id.")
+            parts.append(
+                f"  - {reviewer}: {r.get('summary', '?')} (review id {entry_id}, of {ref})"
+            )
+        parts.append(
+            "  When you fix the issues, set revises to your original entry's agent:id."
+        )
 
     if open_tickets:
         parts.append(f"[fabric] {len(open_tickets)} ticket(s) assigned to you:")
@@ -217,7 +295,9 @@ def on_session_start(session_id="", platform="", **kwargs):
             cid = t.get("customer_id", "?")
             src = t.get("agent", "?")
             entry_id = t.get("id", "?")
-            parts.append(f"  - [{cid}] {t.get('summary', '?')} (from {src}, id {entry_id})")
+            parts.append(
+                f"  - [{cid}] {t.get('summary', '?')} (from {src}, id {entry_id})"
+            )
         parts.append("  Carry customer_id forward when you resolve these.")
 
     # cross-agent feedback (non-pending items)
@@ -238,7 +318,9 @@ def on_session_start(session_id="", platform="", **kwargs):
 
     # creative state
     if creative["questions"]:
-        parts.append(f"[fabric] open questions: {'; '.join(creative['questions'][-3:])}")
+        parts.append(
+            f"[fabric] open questions: {'; '.join(creative['questions'][-3:])}"
+        )
     if creative["learnings"]:
         parts.append(f"[fabric] learnings: {'; '.join(creative['learnings'][-3:])}")
 
@@ -248,11 +330,31 @@ def on_session_start(session_id="", platform="", **kwargs):
 
 # ── Qdrant context injection ──────────────────────────────
 
-_SOCIAL_CLOSERS = frozenset({
-    "ok", "obrigado", "valeu", "beleza", "blz", "tks", "thanks",
-    "👍", "👌", "✅", "feito", "certo", "confirmo", "entendido",
-    "certo", "isso", "sim", "não", "claro", "perfeito", "ótimo"
-})
+_SOCIAL_CLOSERS = frozenset(
+    {
+        "ok",
+        "obrigado",
+        "valeu",
+        "beleza",
+        "blz",
+        "tks",
+        "thanks",
+        "👍",
+        "👌",
+        "✅",
+        "feito",
+        "certo",
+        "confirmo",
+        "entendido",
+        "certo",
+        "isso",
+        "sim",
+        "não",
+        "claro",
+        "perfeito",
+        "ótimo",
+    }
+)
 
 
 def _is_social_close(text):
@@ -261,11 +363,90 @@ def _is_social_close(text):
     if stripped in _SOCIAL_CLOSERS:
         return True
     # Very short ASCII-only without technical markers
-    if len(stripped) < 6 and stripped.isascii() and not any(
-        c in stripped for c in "://.@#$_?"
+    if (
+        len(stripped) < 6
+        and stripped.isascii()
+        and not any(c in stripped for c in "://.@#$_?")
     ):
         return True
     return False
+
+
+def _plugin_candidate_paths():
+    """Directories that may contain the ``scripts.context_enhancer`` module.
+
+    Hermes often loads the plugin from an explicit file path, so the repo root
+    never lands on ``sys.path`` and a bare ``from scripts.context_enhancer
+    import`` raises ImportError. These are the plausible roots, most specific
+    first.
+    """
+    paths = []
+    try:
+        # icarus/hooks.py -> icarus/ -> repo root (holds scripts/context_enhancer.py)
+        paths.append(str(Path(__file__).resolve().parent.parent))
+    except Exception:
+        pass
+    home = os.environ.get("HERMES_HOME") or ""
+    if home:
+        # Deployed layout: <home>/plugins/icarus/ + <home>/plugins/scripts/...
+        paths.append(str(Path(home) / "plugins"))
+        paths.append(str(Path(home)))
+    pdir = getattr(state, "PLUGIN_DIR", None)
+    if pdir:
+        paths.append(str(Path(pdir)))
+        paths.append(str(Path(pdir).parent))
+    deduped = []
+    for p in paths:
+        if p and p not in deduped:
+            deduped.append(p)
+    return deduped
+
+
+def _load_context_enhancer():
+    """Import ``scripts.context_enhancer`` robustly, retrying once.
+
+    A previous ``except Exception: return []`` turned "the module is missing"
+    into "there is nothing in the knowledge base" — an invisible failure. Now
+    a missing module is reported at ERROR with the reason and the remedy.
+
+    Returns the module, or ``None`` (already logged) when it truly cannot be
+    imported.
+    """
+    try:
+        return importlib.import_module("scripts.context_enhancer")
+    except Exception as first_err:
+        added = []
+        for cand in _plugin_candidate_paths():
+            try:
+                if cand and cand not in sys.path and os.path.isdir(cand):
+                    sys.path.insert(0, cand)
+                    added.append(cand)
+            except Exception:
+                continue
+        if added:
+            try:
+                return importlib.import_module("scripts.context_enhancer")
+            except Exception as second_err:
+                logger.error(
+                    "icarus: cannot import scripts.context_enhancer even after "
+                    "adding %s to sys.path (%s: %s). Knowledge-base (Qdrant) "
+                    "recall is DISABLED for this process. Remedy: ship "
+                    "scripts/context_enhancer.py alongside the plugin, or set "
+                    "HERMES_HOME so its plugins/ dir becomes importable.",
+                    added,
+                    type(second_err).__name__,
+                    second_err,
+                )
+                return None
+        logger.error(
+            "icarus: cannot import scripts.context_enhancer (%s: %s). No "
+            "candidate plugin directory was importable either (checked %s). "
+            "Knowledge-base (Qdrant) recall is DISABLED for this process.",
+            type(first_err).__name__,
+            first_err,
+            _plugin_candidate_paths(),
+        )
+        return None
 
 
 def _search_qdrant(query, top_k=2, threshold=0.72):
@@ -273,7 +454,9 @@ def _search_qdrant(query, top_k=2, threshold=0.72):
 
     Returns list of result dicts with keys: id, score, title,
     content_preview, source, tags.
-    Returns empty list on any failure (fail-open).
+    Fail-open on runtime errors (returns []), but a missing/broken
+    ``scripts.context_enhancer`` import is reported at ERROR instead of being
+    silently swallowed.
     """
     old_api_key = os.environ.get("OPENROUTER_API_KEY")
     try:
@@ -282,12 +465,13 @@ def _search_qdrant(query, top_k=2, threshold=0.72):
         if _OPENROUTER_KEY and not old_api_key:
             os.environ["OPENROUTER_API_KEY"] = _OPENROUTER_KEY
 
-        from scripts.context_enhancer import (
-            embed_query, embed_query_sparse, search_with_fallback
-        )
-        dense = embed_query(query)
-        sparse = embed_query_sparse(query)
-        results, _level, _qdrant_ms, _fallback_ms = search_with_fallback(
+        mod = _load_context_enhancer()
+        if mod is None:
+            return []
+
+        dense = mod.embed_query(query)
+        sparse = mod.embed_query_sparse(query)
+        results, _level, _qdrant_ms, _fallback_ms = mod.search_with_fallback(
             dense_vector=dense,
             sparse_vector=sparse,
             query_text=query,
@@ -295,7 +479,14 @@ def _search_qdrant(query, top_k=2, threshold=0.72):
             score_threshold=threshold,
         )
         return results
-    except Exception:
+    except Exception as e:
+        logger.error(
+            "icarus: qdrant search failed (%s: %s) — injecting no knowledge-base "
+            "hits this turn",
+            type(e).__name__,
+            e,
+            exc_info=True,
+        )
         return []
     finally:
         # Restore original env state — never leave a mutation behind.
@@ -311,6 +502,7 @@ def _search_qdrant(query, top_k=2, threshold=0.72):
 def _resolve_state_db():
     """Locate the Hermes session DB. Prefer state.HERMES_HOME, fall back to ~/.hermes."""
     import sqlite3  # noqa: F401 (ensure available)
+
     candidates = []
     home = getattr(state, "HERMES_HOME", None)
     if home:
@@ -329,6 +521,7 @@ def _search_sessions(query, current_session_id="", top_k=2):
     current session. Fail-open: returns [] on any error.
     """
     import sqlite3
+
     db = _resolve_state_db()
     if not db:
         return []
@@ -382,12 +575,14 @@ def _search_sessions(query, current_session_id="", top_k=2):
                 when = datetime.fromtimestamp(float(sa)).strftime("%Y-%m-%d %H:%M")
             except (ValueError, TypeError, OSError):
                 when = str(sa)[:16]
-        out.append({
-            "session_id": sid,
-            "title": r["title"],
-            "when": when,
-            "snippet": (r["snip"] or "").replace("\n", " "),
-        })
+        out.append(
+            {
+                "session_id": sid,
+                "title": r["title"],
+                "when": when,
+                "snippet": (r["snip"] or "").replace("\n", " "),
+            }
+        )
         if len(out) >= top_k:
             break
     return out
@@ -395,17 +590,33 @@ def _search_sessions(query, current_session_id="", top_k=2):
 
 # ── fact_store search (FTS5 over memory_store.db) ────────────
 
-def _search_facts(query, top_k=3):
-    """FTS5 search over durable facts in memory_store.db.
 
-    Returns list of fact content strings. Fail-open: returns [] on error.
+def _facts_db_candidates():
+    """Fact-store locations to probe, most specific first (read-only path)."""
+    cands = []
+    try:
+        cands.append(evolution.resolve_db_path())
+    except Exception:
+        pass
+    home = getattr(state, "HERMES_HOME", None)
+    if home:
+        cands.append(Path(home) / "memory_store.db")
+    cands.append(Path.home() / ".hermes" / "memory_store.db")
+    return cands
+
+
+def _search_facts(query, top_k=3):
+    """FTS5 search over durable facts in memory_store.db, rank-score reranked.
+
+    Oversamples the FTS candidate pool, reorders it with
+    ``evolution.rank_score`` (trust × usage × recency) and returns the top
+    ``top_k``. Returns a list of dicts carrying ``fact_id`` so the caller can
+    record retrievals and apply feedback. Fail-open: returns [] on error.
     """
     import sqlite3
-    db = Path.home() / ".hermes" / "memory_store.db"
-    home = getattr(state, "HERMES_HOME", None)
-    if home and (Path(home) / "memory_store.db").exists():
-        db = Path(home) / "memory_store.db"
-    if not db.exists():
+
+    db = next((c for c in _facts_db_candidates() if c and c.exists()), None)
+    if db is None:
         return []
 
     toks = [t for t in _tokenize(query) if len(t) >= 4]
@@ -413,40 +624,77 @@ def _search_facts(query, top_k=3):
         return []
     fts_query = " OR ".join(toks[:8])
 
+    # Oversample so the evolution rerank has real candidates to choose from.
+    fetch_k = max(20, int(top_k) * 5)
+
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         con.row_factory = sqlite3.Row
         cur = con.cursor()
         rows = cur.execute(
             """
-            SELECT f.content AS content, f.trust_score AS trust
+            SELECT f.*
             FROM facts_fts
             JOIN facts f ON f.fact_id = facts_fts.rowid
             WHERE facts_fts MATCH ?
             ORDER BY rank
             LIMIT ?
             """,
-            (fts_query, top_k),
+            (fts_query, fetch_k),
         ).fetchall()
         con.close()
-    except Exception:
+    except Exception as e:
+        logger.debug("icarus: fact search failed (%s)", e)
         return []
 
-    return [r["content"][:200] for r in rows if r["content"]]
+    scored = []
+    for r in rows:
+        content = r["content"]
+        if not content:
+            continue
+        keys = set(r.keys())
+        trust = r["trust_score"] if "trust_score" in keys else 0.5
+        count = r["retrieval_count"] if "retrieval_count" in keys else 0
+        age = evolution.fact_age_days(
+            r["updated_at"] if "updated_at" in keys else r["created_at"]
+        )
+        rec = {
+            "fact_id": int(r["fact_id"]),
+            "content": str(content)[:200],
+            "trust_score": float(trust or 0.0),
+            "retrieval_count": int(count or 0),
+            "score": evolution.rank_score(trust, count, age),
+        }
+        scored.append(rec)
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[: max(1, int(top_k))]
 
 
 # ── Prompt injection sanitization ────────────────────────────
 
 _INJECTION_PATTERNS = [
     # "ignore all previous/prior instructions/directives"
-    (re.compile(r"(?i)\bignore\s+all\s+(previous|prior)\s+(instructions|directives|commands|messages|prompts|context)"),
-     "[REDACTED]"),
+    (
+        re.compile(
+            r"(?i)\bignore\s+all\s+(previous|prior)\s+(instructions|directives|commands|messages|prompts|context)"
+        ),
+        "[REDACTED]",
+    ),
     # "you are/will now become/act/acting as (a/an) AI/assistant..."
-    (re.compile(r"(?i)\byou\s+(are|will\s+now)\s+(now\s+)?(become|act|acting)\s+as\s+(a\s+|an\s+)?(AI\s+assistant|assistant|AI|agent|LLM|chatbot|model|system)"),
-     "[REDACTED]"),
+    (
+        re.compile(
+            r"(?i)\byou\s+(are|will\s+now)\s+(now\s+)?(become|act|acting)\s+as\s+(a\s+|an\s+)?(AI\s+assistant|assistant|AI|agent|LLM|chatbot|model|system)"
+        ),
+        "[REDACTED]",
+    ),
     # "new instructions/directives/commands follow/above/below"
-    (re.compile(r"(?i)\bnew\s+(instructions|directives|commands)\s+(follow|above|below)"),
-     "[REDACTED]"),
+    (
+        re.compile(
+            r"(?i)\bnew\s+(instructions|directives|commands)\s+(follow|above|below)"
+        ),
+        "[REDACTED]",
+    ),
     # Template injection: {{...}}, ${...}
     (re.compile(r"\{\{.*?\}\}|\$\{.*?\}"), "[REDACTED]"),
     # Triple-backtick code fences
@@ -456,7 +704,10 @@ _INJECTION_PATTERNS = [
     # XML/HTML injection: <script>, event handlers, iframes
     (re.compile(r"<\s*script[\s>]|on\w+\s*=|<\s*iframe[\s>]"), "[sanitized]"),
     # Known system prefixes
-    (re.compile(r"(?i)\[IMPORTANT:.*?\]|\[SYSTEM:.*?\]|\[OVERRIDE:.*?\]"), "[REDACTED]"),
+    (
+        re.compile(r"(?i)\[IMPORTANT:.*?\]|\[SYSTEM:.*?\]|\[OVERRIDE:.*?\]"),
+        "[REDACTED]",
+    ),
     # Control characters (keep newlines and tabs)
     (re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"), ""),
     # Zero-width and invisible Unicode
@@ -473,10 +724,12 @@ def _validate_safe_content(text: str) -> str:
         return text
     try:
         # Count directive-style phrases per character
-        directivess = len(re.findall(
-            r"(?i)\b(ignore|forget|disregard|override|replace|pretend|act\s+as|you\s+(are|must|will|shall))\b",
-            text
-        ))
+        directivess = len(
+            re.findall(
+                r"(?i)\b(ignore|forget|disregard|override|replace|pretend|act\s+as|you\s+(are|must|will|shall))\b",
+                text,
+            )
+        )
         if directivess >= 3 and directivess / max(len(text), 1) > 0.02:
             return "[SANITIZED]"
         return text
@@ -526,33 +779,65 @@ def _env_num(name, default, cast):
 
 
 _COLLAPSE_ON = os.environ.get("ICARUS_COLLAPSE", "1").strip().lower() not in (
-    "0", "false", "no", "off"
+    "0",
+    "false",
+    "no",
+    "off",
 )
 _COLLAPSE_BUDGET = _env_num("ICARUS_COLLAPSE_BUDGET", _collapse.DEFAULTS["budget"], int)
-_COLLAPSE_PRUNE = _env_num("ICARUS_COLLAPSE_PRUNE_RATIO", _collapse.DEFAULTS["prune_ratio"], float)
+_COLLAPSE_PRUNE = _env_num(
+    "ICARUS_COLLAPSE_PRUNE_RATIO", _collapse.DEFAULTS["prune_ratio"], float
+)
 # Tunables for the lexical/source balance. Raise overlap_weight toward 1.0 to
 # favor query-token overlap; lower it to let each source's own ranking (recency,
 # FTS, vector score, encoded via rank_decay) carry more weight — the lever for
 # the "strong-but-low-overlap hit gets starved" tradeoff. (tri-brain Grok)
-_COLLAPSE_DUP = _env_num("ICARUS_COLLAPSE_DUP_OVERLAP", _collapse.DEFAULTS["dup_overlap"], float)
-_COLLAPSE_WEIGHT = _env_num("ICARUS_COLLAPSE_OVERLAP_WEIGHT", _collapse.DEFAULTS["overlap_weight"], float)
-_COLLAPSE_DECAY = _env_num("ICARUS_COLLAPSE_RANK_DECAY", _collapse.DEFAULTS["rank_decay"], float)
+_COLLAPSE_DUP = _env_num(
+    "ICARUS_COLLAPSE_DUP_OVERLAP", _collapse.DEFAULTS["dup_overlap"], float
+)
+_COLLAPSE_WEIGHT = _env_num(
+    "ICARUS_COLLAPSE_OVERLAP_WEIGHT", _collapse.DEFAULTS["overlap_weight"], float
+)
+_COLLAPSE_DECAY = _env_num(
+    "ICARUS_COLLAPSE_RANK_DECAY", _collapse.DEFAULTS["rank_decay"], float
+)
 # Hebbian cross-source amplify knobs (corroboration boosts salience).
-_COLLAPSE_CORRO = _env_num("ICARUS_COLLAPSE_CORRO_OVERLAP", _collapse.DEFAULTS["corroboration_overlap"], float)
-_COLLAPSE_GAIN = _env_num("ICARUS_COLLAPSE_AMPLIFY_GAIN", _collapse.DEFAULTS["amplify_gain"], float)
-_COLLAPSE_CAP = _env_num("ICARUS_COLLAPSE_AMPLIFY_CAP", _collapse.DEFAULTS["amplify_cap"], float)
+_COLLAPSE_CORRO = _env_num(
+    "ICARUS_COLLAPSE_CORRO_OVERLAP", _collapse.DEFAULTS["corroboration_overlap"], float
+)
+_COLLAPSE_GAIN = _env_num(
+    "ICARUS_COLLAPSE_AMPLIFY_GAIN", _collapse.DEFAULTS["amplify_gain"], float
+)
+_COLLAPSE_CAP = _env_num(
+    "ICARUS_COLLAPSE_AMPLIFY_CAP", _collapse.DEFAULTS["amplify_cap"], float
+)
 # Observability: ICARUS_COLLAPSE_DEBUG=1 logs the salience-ranked pool (what
 # survived vs pruned, scores, cross-source corroboration) and a physical-entropy
 # attestation hash over the survivor set — making a recall decision auditable
 # and tamper-evident instead of a black box. (answers tri-brain Grok's
 # "unobservable new surface" concern, 2026-06-04)
 _COLLAPSE_DEBUG = os.environ.get("ICARUS_COLLAPSE_DEBUG", "0").strip().lower() in (
-    "1", "true", "yes", "on"
+    "1",
+    "true",
+    "yes",
+    "on",
 )
 
 
 def _fabric_text(e):
     return e.get("summary") or e.get("_body") or e.get("body") or ""
+
+
+def _fact_text(f):
+    """Text of a fact record — accepts the new dict shape or a raw string.
+
+    ``_search_facts`` now returns dicts (fact_id + content + scores); callers
+    that historically received plain strings (and the collapse adapter tests
+    that still pass strings) must keep working, so both shapes are accepted.
+    """
+    if isinstance(f, dict):
+        return str(f.get("content") or f.get("text") or "")
+    return str(f or "")
 
 
 def _qdrant_text(r):
@@ -576,23 +861,39 @@ def _log_collapse_debug(candidates, qtokens, survivors):
         # Use the SAME tunables the real collapse used, or the debug log would
         # report different salience/corroboration than the actual decision.
         ranked = _collapse.score_all(
-            candidates, qtokens,
-            overlap_weight=_COLLAPSE_WEIGHT, rank_decay=_COLLAPSE_DECAY,
+            candidates,
+            qtokens,
+            overlap_weight=_COLLAPSE_WEIGHT,
+            rank_decay=_COLLAPSE_DECAY,
             corroboration_overlap=_COLLAPSE_CORRO,
-            amplify_gain=_COLLAPSE_GAIN, amplify_cap=_COLLAPSE_CAP,
+            amplify_gain=_COLLAPSE_GAIN,
+            amplify_cap=_COLLAPSE_CAP,
         )
         ranked.sort(key=lambda r: r["salience"], reverse=True)
-        logger.info("icarus collapse: %d candidates -> %d survivors",
-                    len(candidates), len(survivors))
+        logger.info(
+            "icarus collapse: %d candidates -> %d survivors",
+            len(candidates),
+            len(survivors),
+        )
         for r in ranked:
             c = r["candidate"]
             mark = "KEEP" if c.get("key") in kept_keys else "prune"
-            logger.info("  [%-5s] %-8s sal=%.3f corro=%d %s",
-                        mark, str(c.get("source")), r["salience"],
-                        r["corroboration"], str(c.get("text", ""))[:48])
+            logger.info(
+                "  [%-5s] %-8s sal=%.3f corro=%d %s",
+                mark,
+                str(c.get("source")),
+                r["salience"],
+                r["corroboration"],
+                str(c.get("text", ""))[:48],
+            )
         att = _collapse.attest(survivors)
-        logger.info("  attestation: %s (nonce %s…, %d survivors, %s)",
-                    att["hash"][:16], att["nonce"][:12], att["count"], att["algo"])
+        logger.info(
+            "  attestation: %s (nonce %s…, %d survivors, %s)",
+            att["hash"][:16],
+            att["nonce"][:12],
+            att["count"],
+            att["algo"],
+        )
     except Exception:
         logger.debug("icarus: collapse debug logging failed", exc_info=True)
 
@@ -613,39 +914,61 @@ def _apply_collapse(query, fabric, qdrant, sessions, facts):
         candidates = []
 
         for i, e in enumerate(fabric):
-            candidates.append({
-                "key": ("fabric", i), "source": "fabric",
-                "text": _fabric_text(e), "score": None, "rank": i,
-            })
+            candidates.append(
+                {
+                    "key": ("fabric", i),
+                    "source": "fabric",
+                    "text": _fabric_text(e),
+                    "score": None,
+                    "rank": i,
+                }
+            )
         for i, r in enumerate(qdrant):
             sc = r.get("score")
-            candidates.append({
-                "key": ("qdrant", i), "source": "qdrant",
-                "text": _qdrant_text(r),
-                "score": float(sc) if isinstance(sc, (int, float)) else None,
-                "rank": i,
-            })
+            candidates.append(
+                {
+                    "key": ("qdrant", i),
+                    "source": "qdrant",
+                    "text": _qdrant_text(r),
+                    "score": float(sc) if isinstance(sc, (int, float)) else None,
+                    "rank": i,
+                }
+            )
         for i, s in enumerate(sessions):
-            candidates.append({
-                "key": ("sessions", i), "source": "sessions",
-                "text": _session_text(s), "score": None, "rank": i,
-            })
+            candidates.append(
+                {
+                    "key": ("sessions", i),
+                    "source": "sessions",
+                    "text": _session_text(s),
+                    "score": None,
+                    "rank": i,
+                }
+            )
         for i, f in enumerate(facts):
-            candidates.append({
-                "key": ("facts", i), "source": "facts",
-                "text": str(f), "score": None, "rank": i,
-            })
+            candidates.append(
+                {
+                    "key": ("facts", i),
+                    "source": "facts",
+                    "text": _fact_text(f),
+                    "score": None,
+                    "rank": i,
+                }
+            )
 
         if not candidates:
             return fabric, qdrant, sessions, facts
 
         survivors = _collapse.collapse(
-            candidates, qtokens,
-            budget=_COLLAPSE_BUDGET, prune_ratio=_COLLAPSE_PRUNE,
-            dup_overlap=_COLLAPSE_DUP, overlap_weight=_COLLAPSE_WEIGHT,
+            candidates,
+            qtokens,
+            budget=_COLLAPSE_BUDGET,
+            prune_ratio=_COLLAPSE_PRUNE,
+            dup_overlap=_COLLAPSE_DUP,
+            overlap_weight=_COLLAPSE_WEIGHT,
             rank_decay=_COLLAPSE_DECAY,
             corroboration_overlap=_COLLAPSE_CORRO,
-            amplify_gain=_COLLAPSE_GAIN, amplify_cap=_COLLAPSE_CAP,
+            amplify_gain=_COLLAPSE_GAIN,
+            amplify_cap=_COLLAPSE_CAP,
         )
         keep = {c["key"] for c in survivors}
 
@@ -673,16 +996,20 @@ def _apply_collapse(query, fabric, qdrant, sessions, facts):
         # Fail-open: never let a collapse error block memory injection. Logged at
         # WARNING so a silently-disabled collapse is detectable in production
         # rather than only inferable from "did the right memories appear?".
-        logger.warning("icarus: recall collapse failed — injecting unchanged",
-                       exc_info=True)
+        logger.warning(
+            "icarus: recall collapse failed — injecting unchanged", exc_info=True
+        )
         return fabric, qdrant, sessions, facts
 
 
 def pre_llm_call(session_id="", user_message="", is_first_turn=False, **kwargs):
     """Inject relevant memories when topic changes (fabric + Qdrant)."""
-    global _last_query_tokens
     if not user_message:
         return None
+
+    # Session-isolated dedup/overlap state (see _session_bucket).
+    state.bind_session(session_id)
+    bucket = _session_bucket(session_id)
 
     tokens = _tokenize(user_message)
     if not tokens:
@@ -691,14 +1018,15 @@ def pre_llm_call(session_id="", user_message="", is_first_turn=False, **kwargs):
     # Overlap gate: only suppress on NEAR-LITERAL repetition of the previous
     # turn (>0.85). The old 0.6 gate killed all injection in long single-topic
     # sessions — exactly when accumulated context matters most. We now keep
-    # injecting and rely on per-source dedup (_injected_* sets) to avoid
-    # repeating identical results turn after turn.
-    if _last_query_tokens:
-        overlap = len(tokens & _last_query_tokens) / max(len(tokens), 1)
+    # injecting and rely on per-source dedup sets to avoid repeating identical
+    # results turn after turn.
+    last_tokens = bucket["last_query_tokens"]
+    if last_tokens:
+        overlap = len(tokens & last_tokens) / max(len(tokens), 1)
         if overlap > 0.85:
             return None
 
-    _last_query_tokens = tokens
+    bucket["last_query_tokens"] = tokens
 
     is_social = _is_social_close(user_message)
 
@@ -754,9 +1082,9 @@ def pre_llm_call(session_id="", user_message="", is_first_turn=False, **kwargs):
                 e.get("summary") or e.get("_body", e.get("body", "")), max_len=80
             )
             eid = str(e.get("id", "")) or summary[:60]
-            if eid in _injected_fabric:
+            if eid in bucket["injected_fabric"]:
                 continue
-            _injected_fabric.add(eid)
+            bucket["injected_fabric"].add(eid)
             ts = str(e.get("timestamp", ""))[:16] or "?"
             lines.append(f"  [{ts}] {e.get('agent', '?')}: {summary}")
             emitted += 1
@@ -769,9 +1097,9 @@ def pre_llm_call(session_id="", user_message="", is_first_turn=False, **kwargs):
         emitted = 0
         for r in qdrant_results:
             rid = str(r.get("id", "")) or str(r.get("content_preview", ""))[:40]
-            if rid in _injected_qdrant:
+            if rid in bucket["injected_qdrant"]:
                 continue
-            _injected_qdrant.add(rid)
+            bucket["injected_qdrant"].add(rid)
             source = r.get("source", "?")
             title = r.get("title", "")
             score = r.get("score", 0)
@@ -790,9 +1118,9 @@ def pre_llm_call(session_id="", user_message="", is_first_turn=False, **kwargs):
         emitted = 0
         for s in session_results:
             sid = s.get("session_id", "")
-            if sid in _injected_sessions:
+            if sid in bucket["injected_sessions"]:
                 continue
-            _injected_sessions.add(sid)
+            bucket["injected_sessions"].add(sid)
             title = s.get("title") or "(untitled)"
             snippet = _sanitize_context_text(s.get("snippet", ""), max_len=200)
             when = s.get("when", "")
@@ -801,28 +1129,121 @@ def pre_llm_call(session_id="", user_message="", is_first_turn=False, **kwargs):
         if emitted:
             parts.append("\n".join(lines))
 
-    # fact_store context (first turn only)
+    # fact_store context (first turn only). Facts are dicts now: dedup by
+    # fact_id, remember what we actually injected (for post-hoc feedback), and
+    # bump the retrieval counter so rank_score learns which facts get used.
+    newly_injected_fact_ids = []
     if fact_results:
         lines = ["[facts] durable facts about the user/environment:"]
+        emitted = 0
         for f in fact_results:
-            lines.append(f"  - {_sanitize_context_text(f, max_len=200)}")
-        parts.append("\n".join(lines))
+            text = _fact_text(f)
+            if not text:
+                continue
+            fid = f.get("fact_id") if isinstance(f, dict) else None
+            if fid is not None:
+                if fid in bucket["injected_facts"]:
+                    continue
+                bucket["injected_facts"][fid] = text
+                newly_injected_fact_ids.append(fid)
+            lines.append(f"  - {_sanitize_context_text(text, max_len=200)}")
+            emitted += 1
+        if emitted:
+            parts.append("\n".join(lines))
 
     if not parts:
         return None
 
+    # Record the retrieval only once we know the facts actually reached the
+    # prompt (parts non-empty). Failure here must never break injection.
+    if newly_injected_fact_ids:
+        try:
+            evolution.record_retrieval(newly_injected_fact_ids)
+        except Exception:
+            logger.debug("icarus: record_retrieval failed", exc_info=True)
+
     return {"context": "\n\n".join(parts)}
 
 
-def post_llm_call(session_id="", user_message="", assistant_response="", platform="", **kwargs):
+# ── Automatic fact-usage feedback ────────────────────────────
+# A fact counts as "used" when a meaningful share of its content tokens
+# reappears in the assistant's reply. Conservative by design: only
+# helpful=True is ever applied. A low-overlap turn means "not relevant now",
+# NOT "misleading", so it must never be punished — otherwise every fact would
+# bleed trust just for being injected. (Contract §三·C.2)
+_FEEDBACK_OVERLAP_MIN = 0.5  # ≥50% of the fact's tokens must reappear
+_FEEDBACK_MIN_CHARS = 12  # ignore trivially short facts
+
+
+def _fact_tokens(text: str) -> set:
+    """Content tokens of a fact: ASCII words (len>=2) + CJK bigrams.
+
+    ``_tokenize`` is ASCII-only, so a purely Chinese fact would always score
+    0.0 overlap and could never be rewarded. CJK bigrams give Chinese text a
+    usable overlap signal without pulling in a tokenizer dependency.
+    """
+    text = str(text or "")
+    toks = {t for t in re.findall(r"[a-z0-9]{2,}", text.lower())}
+    cjk = re.findall(r"[\u4e00-\u9fff]", text)
+    for i in range(len(cjk) - 1):
+        toks.add(cjk[i] + cjk[i + 1])
+    return toks
+
+
+def _auto_feedback(session_id, assistant_response) -> int:
+    """Reward facts whose content reappeared in the reply. Returns count.
+
+    One-shot: every injected fact is judged exactly once (then removed from the
+    pool) so a later turn's unrelated answer can't re-judge it.
+    """
+    bucket = _session_bucket(session_id)
+    pool = bucket["injected_facts"]
+    if not pool or not assistant_response:
+        return 0
+    resp_tokens = _fact_tokens(assistant_response)
+    if not resp_tokens:
+        return 0
+
+    rewarded = 0
+    for fid, fact_text in list(pool.items()):
+        pool.pop(fid, None)
+        text = str(fact_text or "")
+        if len(text) < _FEEDBACK_MIN_CHARS:
+            continue  # too short to judge — drop silently, no penalty
+        ftoks = _fact_tokens(text)
+        if not ftoks:
+            continue
+        overlap = len(ftoks & resp_tokens) / len(ftoks)
+        if overlap >= _FEEDBACK_OVERLAP_MIN:
+            try:
+                evolution.apply_feedback(fid, helpful=True)
+                rewarded += 1
+            except Exception:
+                logger.debug(
+                    "icarus: auto feedback failed for fact %s", fid, exc_info=True
+                )
+    return rewarded
+
+
+def post_llm_call(
+    session_id="", user_message="", assistant_response="", platform="", **kwargs
+):
     """Capture high-value decisions + creative tracking."""
     if not assistant_response:
         return
 
-    state.exchanges.append({
-        "user": (user_message or "")[:200],
-        "assistant": assistant_response[:500],
-    })
+    state.bind_session(session_id)
+    state.exchanges.append(
+        {
+            "user": (user_message or "")[:200],
+            "assistant": assistant_response[:500],
+        }
+    )
+
+    # ── Automatic usage feedback: reward facts the reply actually leaned on ──
+    rewarded = _auto_feedback(session_id, assistant_response)
+    if rewarded:
+        logger.info("icarus: rewarded %d fact(s) as helpful", rewarded)
 
     agent = state.AGENT_NAME or "agent"
     plat = platform or "cli"
@@ -830,15 +1251,25 @@ def post_llm_call(session_id="", user_message="", assistant_response="", platfor
     # capture decisions: requires decision + outcome in response, AND a substantial
     # user request (>50 chars) to ground the claim
     user_text = (user_message or "").strip()
-    if (state.DECISION_RE.search(assistant_response)
-            and state.OUTCOME_RE.search(assistant_response)
-            and len(assistant_response) > 200
-            and len(user_text) > 50):
+    if (
+        state.DECISION_RE.search(assistant_response)
+        and state.OUTCOME_RE.search(assistant_response)
+        and len(assistant_response) > 200
+        and len(user_text) > 50
+    ):
         body = f"Task: {user_text[:_TASK_MAX]}\n\nResult: {assistant_response[:_RESULT_MAX]}"
         summary = assistant_response[:80].replace("\n", " ")
-        entry_status = "completed" if state.COMPLETION_RE.search(assistant_response) else ""
-        state.write_entry("decision", body, summary,
-                         platform=plat, status=entry_status, training_value="high")
+        entry_status = (
+            "completed" if state.COMPLETION_RE.search(assistant_response) else ""
+        )
+        state.write_entry(
+            "decision",
+            body,
+            summary,
+            platform=plat,
+            status=entry_status,
+            training_value="high",
+        )
 
     # creative tracking (uses broader _THEME_RE, doesn't write entries)
     creative = state.load_creative()
@@ -873,6 +1304,7 @@ def post_llm_call(session_id="", user_message="", assistant_response="", platfor
 
 # ── LLM-powered session extraction ────────────────────────
 
+
 def _parse_json_robust(raw):
     """Extract JSON array/object from LLM output with markdown tolerances.
 
@@ -887,7 +1319,7 @@ def _parse_json_robust(raw):
     # Strip markdown code fences
     for fence in ("```json", "```"):
         if text.startswith(fence):
-            text = text[len(fence):].lstrip()
+            text = text[len(fence) :].lstrip()
         if text.endswith("```"):
             text = text[:-3].rstrip()
 
@@ -920,9 +1352,9 @@ def _build_transcript(exchanges):
         user = (ex.get("user") or "").strip()
         assistant = (ex.get("assistant") or "").strip()
         if user:
-            lines.append(f"[Turn {i+1} — User]\n{user[:500]}")
+            lines.append(f"[Turn {i + 1} — User]\n{user[:500]}")
         if assistant:
-            lines.append(f"[Turn {i+1} — Agent]\n{assistant[:800]}")
+            lines.append(f"[Turn {i + 1} — Agent]\n{assistant[:800]}")
     return "\n\n".join(lines)
 
 
@@ -934,8 +1366,10 @@ def _llm_extract_entries(transcript):
     """
     api_key = _resolve_llm_api_key()
     if not api_key:
-        logger.warning("icarus: no LLM API key found (checked ICARUS_API_KEY_ENV, "
-                        "DEEPSEEK_API_KEY, OPENROUTER_API_KEY) — skipping LLM extraction")
+        logger.warning(
+            "icarus: no LLM API key found (checked ICARUS_API_KEY_ENV, "
+            "DEEPSEEK_API_KEY, OPENROUTER_API_KEY) — skipping LLM extraction"
+        )
         return []
 
     prompt = (
@@ -943,37 +1377,38 @@ def _llm_extract_entries(transcript):
         "transcript and extract ONLY significant entries worth preserving in a "
         "cross-agent knowledge base. Skip trivial sessions, greetings, and routine chatter.\n\n"
         "For each significant entry, provide:\n"
-        "- type: \"decision\" (technical decision with rationale), "
-        "\"resolution\" (bug fix or problem solved), "
-        "or \"note\" (discovery or learning)\n"
-        "- summary: one line, max 80 chars, in the original language of the session\n"
+        '- type: "decision" (technical decision with rationale), '
+        '"resolution" (bug fix or problem solved), '
+        'or "note" (discovery or learning)\n'
+        "- summary: one line, max 80 chars, in the original language of the session (e.g. Chinese if transcript is Chinese)\n"
         "- content: structured markdown with ## Context, ## Action/Decision, and ## Outcome. "
-        "Include concrete details: commands, paths, error messages, decisions made.\n"
-        "- training_value: \"high\" (outcome verified, artifact produced, decision with evidence), "
-        "\"normal\" (useful context or progress), "
-        "or \"low\" (marginal, but not zero)\n\n"
+        "Include concrete details: commands, paths, error messages, decisions made. "
+        "Keep the content in the same language as the transcript (write in natural Chinese if the session was in Chinese).\n"
+        '- training_value: "high" (outcome verified, artifact produced, decision with evidence), '
+        '"normal" (useful context or progress), '
+        'or "low" (marginal, but not zero)\n\n'
         "If the session contains NOTHING worth preserving across sessions, "
         "return an empty array: []\n\n"
         "Return ONLY valid JSON array, no other text:\n"
         '[{"type": "decision", "summary": "...", "content": "...", "training_value": "high"}, ...]'
     )
 
-    payload = json.dumps({
-        "model": _resolve_llm_model(),
-        "messages": [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": transcript[:8000]}
-        ],
-        "max_tokens": _EXTRACTION_MAX_TOKENS,
-        "temperature": 0.2
-    }).encode("utf-8")
+    payload = json.dumps(
+        {
+            "model": _resolve_llm_model(),
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": transcript[:8000]},
+            ],
+            "max_tokens": _EXTRACTION_MAX_TOKENS,
+            "temperature": 0.2,
+        }
+    ).encode("utf-8")
 
     try:
         endpoint = _resolve_llm_endpoint()
         req = urllib.request.Request(
-            endpoint,
-            data=payload,
-            headers=_resolve_llm_headers(api_key)
+            endpoint, data=payload, headers=_resolve_llm_headers(api_key)
         )
         resp = urllib.request.urlopen(req, timeout=45)
         body = json.loads(resp.read().decode("utf-8"))
@@ -997,7 +1432,9 @@ def _llm_extract_entries(transcript):
                     extracted = []
 
         if not isinstance(extracted, list):
-            logger.warning("icarus: LLM extraction returned non-list: %s", type(extracted))
+            logger.warning(
+                "icarus: LLM extraction returned non-list: %s", type(extracted)
+            )
             return []
 
         # Validate and filter
@@ -1013,33 +1450,51 @@ def _llm_extract_entries(transcript):
                 continue
             if len(summary) < 10 or len(content) < 60:
                 continue
-            valid.append({
-                "type": etype,
-                "summary": summary[:80],
-                "content": content[:2000],
-                "training_value": entry.get("training_value", "normal")
-            })
+            valid.append(
+                {
+                    "type": etype,
+                    "summary": summary[:80],
+                    "content": content[:2000],
+                    "training_value": entry.get("training_value", "normal"),
+                }
+            )
 
         return valid
 
-    except (urllib.error.URLError, json.JSONDecodeError, KeyError, IndexError, ValueError,
-            ConnectionError, TimeoutError, OSError) as e:
-        logger.warning("icarus: LLM extraction failed (%s) — falling back to legacy", type(e).__name__)
+    except (
+        urllib.error.URLError,
+        json.JSONDecodeError,
+        KeyError,
+        IndexError,
+        ValueError,
+        ConnectionError,
+        TimeoutError,
+        OSError,
+    ) as e:
+        logger.warning(
+            "icarus: LLM extraction failed (%s) — falling back to legacy",
+            type(e).__name__,
+        )
         return []
 
 
 def _legacy_session_write(platform, scores):
-    """Fallback: original truncated session write (pre-LLM behavior)."""
+    """Fallback: original truncated session write (pre-LLM behavior).
+
+    Returns the entry ``content`` it wrote (or ``""``), so the caller can also
+    mirror it into the fact store.
+    """
     plat = platform or "cli"
     parts = []
 
     first_user = next(
         (
-            ex["user"] for ex in state.exchanges
+            ex["user"]
+            for ex in state.exchanges
             if len(ex.get("user", "").strip()) > 50
             and not _is_system_injection(ex.get("user", ""))
         ),
-        None
+        None,
     )
     if first_user:
         parts.append(f"## Task\n{first_user[:_TASK_MAX]}")
@@ -1050,18 +1505,24 @@ def _legacy_session_write(platform, scores):
             parts.append(f"## Decision\n{resp[:500]}")
             break
 
-    substantive = [ex for ex in state.exchanges if len(ex.get("assistant", "").strip()) > 100]
+    substantive = [
+        ex for ex in state.exchanges if len(ex.get("assistant", "").strip()) > 100
+    ]
     if substantive:
         parts.append(f"## Result\n{substantive[-1]['assistant'][:_RESULT_MAX]}")
 
-    content = "\n\n".join(parts) if parts else state.exchanges[-1].get("assistant", "")[:500]
+    content = (
+        "\n\n".join(parts) if parts else state.exchanges[-1].get("assistant", "")[:500]
+    )
 
     if substantive:
-        result_text = substantive[-1]['assistant']
+        result_text = substantive[-1]["assistant"]
     else:
         result_text = content
     summary = re.sub(r"\s+", " ", result_text.replace("\n", " ")).strip()[:80]
-    summary = re.sub(r"-{2,}", "—", summary)  # sanitize: prevent YAML frontmatter breakage
+    summary = re.sub(
+        r"-{2,}", "—", summary
+    )  # sanitize: prevent YAML frontmatter breakage
 
     if scores["total"] >= 0.6:
         tv = "high"
@@ -1070,14 +1531,71 @@ def _legacy_session_write(platform, scores):
     else:
         tv = "low"
 
-    state.write_entry("session", content, summary, platform=plat,
-                     training_value=tv, status="completed")
+    state.write_entry(
+        "session",
+        content,
+        summary,
+        platform=plat,
+        training_value=tv,
+        status="completed",
+    )
+    return content
+
+
+def _writeback_session_facts(texts, session_id) -> int:
+    """Mirror session-extracted entries into the durable fact store.
+
+    This closes the "read-only" breakpoint: pre_llm_call pulled facts in, but
+    nothing ever wrote new ones, so agent experience never fed the store.
+    Duplicate content collapses on the UNIQUE ``content`` column (record_fact
+    returns the existing id) — harmless and idempotent.
+    """
+    sid = session_id or ""
+    stored = 0
+    for text in texts:
+        body = str(text or "").strip()
+        if len(body) < 20:
+            continue
+        try:
+            fid = evolution.record_fact(
+                body,
+                category="session",
+                tags=f"session:{sid}" if sid else "session",
+            )
+        except Exception:
+            logger.debug("icarus: fact writeback failed", exc_info=True)
+            continue
+        if fid is not None:
+            stored += 1
+    return stored
+
+
+def _settle_session_feedback(session_id) -> int:
+    """Judge any still-unjudged injected fact against the session's replies."""
+    bucket = _session_bucket(session_id)
+    if not bucket["injected_facts"]:
+        return 0
+    replies = " ".join(str(ex.get("assistant") or "") for ex in state.exchanges)
+    return _auto_feedback(session_id, replies)
 
 
 def on_session_end(session_id="", platform="", completed=False, **kwargs):
-    """Score session, extract entries via LLM, fall back to legacy truncation."""
+    """Score session, extract entries via LLM, fall back to legacy truncation.
+
+    Extracted entries are also mirrored into the durable fact store so the
+    self-evolution loop has a write path, and this session's injected facts get
+    a final usage settlement.
+    """
+    state.bind_session(session_id)
+
     creative = state.load_creative()
     state.write_memory_file(creative)
+
+    # ── Final usage settlement (facts still unjudged, e.g. injected on the
+    #    last turn which post_llm_call never got to score) ──
+    settled = _settle_session_feedback(session_id)
+    if settled:
+        logger.info("icarus: session-end rewarded %d fact(s) as helpful", settled)
 
     if not state.exchanges:
         return
@@ -1100,10 +1618,18 @@ def on_session_end(session_id="", platform="", completed=False, **kwargs):
                 entry["summary"],
                 platform=plat,
                 training_value=entry.get("training_value", "normal"),
-                status="completed"
+                status="completed",
             )
         logger.info("icarus: LLM extracted %d entries from session", len(entries))
+        written = _writeback_session_facts(
+            [e.get("content", "") for e in entries], session_id
+        )
+        if written:
+            logger.info("icarus: wrote back %d fact(s) to the evolution store", written)
     else:
         # ── Legacy fallback ──
         logger.info("icarus: LLM extraction produced nothing — using legacy truncation")
-        _legacy_session_write(platform, scores)
+        legacy_content = _legacy_session_write(platform, scores)
+        written = _writeback_session_facts([legacy_content or ""], session_id)
+        if written:
+            logger.info("icarus: wrote back %d fact(s) to the evolution store", written)

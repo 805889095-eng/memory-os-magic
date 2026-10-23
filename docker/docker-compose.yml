@@ -67,14 +67,20 @@ services:
       QDRANT_PORT: "6333"
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:-https://openrouter.ai/api/v1}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-qwen/qwen3-embedding-8b}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
       EMBEDDING_DIMS: "${EMBEDDING_DIMS:-4096}"
+      LLM_API_BASE: ${LLM_API_BASE:-https://openrouter.ai/api/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-deepseek/deepseek-chat}
       COLLECTION_NAME: "${COLLECTION_NAME:-knowledge_base}"
       ARQ_JOB_TIMEOUT: "300"
       ARQ_MAX_JOBS: "10"
       ARQ_KEEP_RESULT: "3600"
+      ARQ_MAX_TRIES: ${ARQ_MAX_TRIES:-3}
+      HERMES_DLQ_PATH: ${HERMES_DLQ_PATH:-/hermes/wiki_ingest_failures.json}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - ${MEMORY_OS_WIKI_PATH:-./wiki}:/wiki:ro

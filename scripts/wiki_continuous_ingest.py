@@ -18,18 +18,26 @@ from arq.connections import RedisSettings
 import redis.asyncio as aioredis
 
 # ─── Config ────────────────────────────────────────────────────────────────
-ENV_PATH = Path.home() / "memory-os" / "docker" / ".env"
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+# MAA_ENV_PATH takes precedence; the default keeps the legacy path for compat.
+ENV_PATH = Path(
+    os.environ.get("MAA_ENV_PATH", str(Path.home() / "memory-os" / "docker" / ".env"))
+)
 if ENV_PATH.exists():
     load_dotenv(ENV_PATH)
 
 WIKI_ROOT = Path(os.environ.get("WIKI_ROOT", str(Path.home() / "vault" / "wiki")))
-STATE_FILE = Path.home() / ".hermes" / "wiki_ingest_state.json"
-FAILURES_FILE = Path.home() / ".hermes" / "wiki_ingest_failures.json"
+STATE_FILE = Path(
+    os.environ.get("WIKI_STATE_PATH", str(HERMES_HOME / "wiki_ingest_state.json"))
+)
+FAILURES_FILE = Path(
+    os.environ.get("HERMES_DLQ_PATH", str(HERMES_HOME / "wiki_ingest_failures.json"))
+)
 REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "")
 
 # Fallback: read REDIS_PASSWORD from Docker .env if not in environment (cron context)
 if not REDIS_PASSWORD:
-    DOCKER_ENV = Path.home() / "memory-os" / "docker" / ".env"
+    DOCKER_ENV = ENV_PATH
     if DOCKER_ENV.exists():
         load_dotenv(DOCKER_ENV)
         REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "")
@@ -155,9 +163,13 @@ async def main():
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "file": rel_path,
                 "error": error_msg,
-                "failure_class": failure_class,   # NOVO: classificação
-                "reported": False,                 # NOVO: ainda não reportado
-                "retry_count": 0,                  # NOVO: zero retries
+                "failure_class": failure_class,
+                "reported": False,
+                "retry_count": 0,
+                "last_retry": None,
+                "error_hash": hashlib.sha256(
+                    f"{rel_path}:{error_msg}".encode("utf-8")
+                ).hexdigest()[:16],
             })
             print(f"  ⚠️  Falha: {rel_path} — {e} [{failure_class}]")
 
