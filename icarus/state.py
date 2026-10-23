@@ -1409,21 +1409,27 @@ def rollback_model():
             )
         }
 
-    # What would actually change: a value that differs, a key the backup adds,
-    # or a managed key the backup drops. Comparing only LLM_MODEL let a call
-    # report "rolled_back" while every managed value already matched.
+    # What would actually change. A rollback RESTORES the model configuration
+    # recorded in the backup — the model name AND its provider endpoint, since
+    # they must move together — but it never DELETES a key the backup lacks.
+    #
+    # The delete rule is the important one: an earlier revision removed managed
+    # keys missing from the backup, so a stale backup silently deleted a live
+    # `LLM_API_BASE`. Data loss disguised as a model rollback.
     to_write = {}
     for key, line in restorable.items():
         if current.get(key) != line:
             to_write[key] = line
-    to_remove = [k for k in current if managed(k) and k not in restorable]
-    if not to_write and not to_remove:
+    if not to_write:
         return {
             "error": (
                 f"nothing to roll back: live .env already matches {backup.name} "
                 f"for every managed key ({', '.join(sorted(restorable))})"
             )
         }
+
+    # Managed keys the backup has no value for: reported, never modified.
+    unmatched = sorted(k for k in current if managed(k) and k not in restorable)
 
     before_model = current.get("LLM_MODEL", "")
 
@@ -1438,7 +1444,6 @@ def rollback_model():
 
     lines = env_file.read_text(encoding="utf-8").split("\n") if env_file.exists() else []
     replaced = set()
-    dropped = set()
     kept = []
     for line in lines:
         stripped = line.strip()
@@ -1449,11 +1454,6 @@ def rollback_model():
         if key in to_write:
             kept.append(to_write[key])
             replaced.add(key)
-            continue
-        if key in to_remove:
-            # The backup has no such managed key, so the rollback removes it —
-            # but only this one line; neighbours are untouched.
-            dropped.add(key)
             continue
         kept.append(line)
     appended = [v for k, v in to_write.items() if k not in replaced]
@@ -1491,7 +1491,7 @@ def rollback_model():
         "from_model": before_model.split("=", 1)[-1].strip() if before_model else None,
         "to_model": restored_model,
         "keys_restored": sorted(replaced | set(appended)),
-        "keys_dropped": sorted(dropped),
+        "keys_left_alone": unmatched,
         "keys_preserved": sorted(k for k in current if not managed(k)),
         "safety_copy": str(safety),
     }

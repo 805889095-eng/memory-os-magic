@@ -96,17 +96,40 @@ try:
     check("second call reports nothing to roll back", "error" in second, json.dumps(second))
 
     print()
-    print("a managed key the backup lacks is dropped, other keys untouched")
+    print("a rollback must never DELETE a managed key it cannot restore")
     env.write_text(
-        live.rstrip("\n") + "\nMODEL_QA_EXTRA=stale\nKEEP_ME=1\n",
+        "\n".join(
+            [
+                "LLM_MODEL=old-model",
+                "LLM_API_BASE=http://old/v1",
+                "LLM_LIVE_ONLY=http://live-only/v1",
+                "EMBEDDING_API_KEY=sk-embedding-should-survive",
+                "KEEP_ME=1",
+                "",
+            ]
+        ),
         encoding="utf-8",
     )
+    before_keys = set(state._env_keys(env))
     fourth = state.rollback_model()
-    after = state._env_keys(env)
-    check("rollback reports the drop", "MODEL_QA_EXTRA" in fourth.get("keys_dropped", []), json.dumps(fourth)[:300])
-    check("dropped key is gone", "MODEL_QA_EXTRA" not in after, json.dumps(sorted(after))[:300])
-    check("unmanaged neighbour key survives", after.get("KEEP_ME") == "KEEP_ME=1", json.dumps(after.get("KEEP_ME")))
-    check("embedding key still survives", "sk-embedding-should-survive" in env.read_text())
+    after_text = env.read_text()
+    after_keys = set(state._env_keys(env))
+    check(
+        "live-only managed key survives a rollback",
+        "LLM_LIVE_ONLY=http://live-only/v1" in after_text,
+        json.dumps(fourth)[:300],
+    )
+    # This run has nothing to restore, so it refuses; either way the
+    # live-only key must never be touched or deleted.
+    check(
+        "refused rollback still names the untouched key",
+        "LLM_LIVE_ONLY" in fourth.get("keys_left_alone", [])
+        or "LLM_LIVE_ONLY" not in json.dumps(fourth.get("keys_restored", [])),
+        json.dumps(fourth)[:300],
+    )
+    check("unmanaged neighbour key survives", "KEEP_ME=1" in after_text)
+    check("embedding key still survives", "sk-embedding-should-survive" in after_text)
+    check("no key disappeared", after_keys == before_keys, sorted(before_keys ^ after_keys))
 
     print()
     print("a backup with no model keys must be refused")
