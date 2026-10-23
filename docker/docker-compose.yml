@@ -50,7 +50,7 @@ services:
       start_period: 10s
 
   worker:
-    image: ghcr.io/805889095-eng/memory-os-worker:latest
+    image: ghcr.io/805889095-eng/memory-os-magic-worker:latest
     build:
       context: ./worker
       dockerfile: Dockerfile

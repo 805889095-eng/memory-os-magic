@@ -44,7 +44,7 @@ jobs:
           file: ./docker/worker/Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ steps.repo_owner.outputs.owner }}/memory-os-worker:latest
-            ghcr.io/${{ steps.repo_owner.outputs.owner }}/memory-os-worker:${{ github.sha }}
+            ghcr.io/${{ steps.repo_owner.outputs.owner }}/memory-os-magic-worker:latest
+            ghcr.io/${{ steps.repo_owner.outputs.owner }}/memory-os-magic-worker:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
