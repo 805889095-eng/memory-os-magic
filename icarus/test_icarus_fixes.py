@@ -43,6 +43,7 @@ sys.modules["icarus"] = _mod
 _spec.loader.exec_module(_mod)
 
 from icarus import _yaml, evolution, parsing, state  # noqa: E402
+from icarus import hooks  # noqa: E402
 
 SCRATCH = os.environ.get("ICARUS_TEST_SCRATCH") or None
 PASS, FAIL = [], []
@@ -216,6 +217,85 @@ try:
     )
 finally:
     _yaml._BACKEND = real_backend
+
+# ── 10. extraction must not store a reply the model ran out of tokens on ──
+# `_parse_json_robust` strips trailing characters until json.loads succeeds, so
+# a truncated array still yields a *prefix* of the entries. With max_tokens=1024
+# the model stopped at finish_reason="length" and six half-written facts (all
+# exactly 1024 chars, identical openings, dangling endings) reached the store.
+print("\n10. LLM extraction truncation guard")
+
+check(
+    "default extraction budget is not the truncating 1024",
+    hooks._EXTRACTION_MAX_TOKENS > 1024,
+    str(hooks._EXTRACTION_MAX_TOKENS),
+)
+
+import urllib.request as _urlreq
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = json.dumps(payload).encode()
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+_truncated_choice = {
+    "choices": [
+        {
+            # A syntactically valid prefix: the array closes, but the single
+            # entry's content is cut mid-sentence.
+            "message": {
+                "content": '[{"type": "note", "summary": "half written entry here", '
+                '"content": "## Context\\n这是一个被截断的内容，写到一半就没了", '
+                '"training_value": "normal"}]'
+            },
+            "finish_reason": "length",
+        }
+    ]
+}
+
+_orig_urlopen = _urlreq.urlopen
+_orig_key = hooks._resolve_llm_api_key
+hooks._resolve_llm_api_key = lambda: "test-key"
+_urlreq.urlopen = lambda *a, **k: _FakeResponse(_truncated_choice)
+try:
+    got = hooks._llm_extract_entries("[Turn 1 — User]\nhello\n\n[Turn 2 — Agent]\nworld")
+    check("truncated (finish_reason=length) reply yields no entries", got == [], str(got))
+finally:
+    _urlreq.urlopen = _orig_urlopen
+    hooks._resolve_llm_api_key = _orig_key
+
+# The guard must not swallow well-formed replies.
+_ok_choice = {
+    "choices": [
+        {
+            "message": {
+                "content": '[{"type": "note", "summary": "a complete entry summary here", '
+                '"content": "## Context\\n这是一段足够长的完整内容，用来通过提炼结果的长度校验。'
+                '\\n\\n## Outcome\\n已经完成并验证通过，收尾完整。", '
+                '"training_value": "high"}]'
+            },
+            "finish_reason": "stop",
+        }
+    ]
+}
+hooks._resolve_llm_api_key = lambda: "test-key"
+_urlreq.urlopen = lambda *a, **k: _FakeResponse(_ok_choice)
+try:
+    got = hooks._llm_extract_entries("[Turn 1 — User]\nhello\n\n[Turn 2 — Agent]\nworld")
+    check("complete reply still parses", len(got) == 1, str(got))
+finally:
+    _urlreq.urlopen = _orig_urlopen
+    hooks._resolve_llm_api_key = _orig_key
 
 print("\n" + "=" * 64)
 print(f"pass {len(PASS)} / fail {len(FAIL)}")

@@ -35,7 +35,11 @@ _ICARUS_ENDPOINT = os.environ.get("ICARUS_ENDPOINT", "").strip().rstrip("/")
 _ICARUS_API_KEY_ENV = os.environ.get("ICARUS_API_KEY_ENV", "").strip()
 
 _EXTRACTION_MODEL = _LLM_MODEL or os.environ.get("ICARUS_EXTRACTION_MODEL", "deepseek/deepseek-chat")
-_EXTRACTION_MAX_TOKENS = int(os.environ.get("ICARUS_EXTRACTION_MAX_TOKENS", "1024"))
+# 1024 truncates the JSON mid-object on a normal session: the model stops at
+# `finish_reason: length`, the truncated array still parses, and half-written
+# entries land in the store. .env.example has warned about this for a while and
+# recommends 4096; the code default was never updated to match.
+_EXTRACTION_MAX_TOKENS = int(os.environ.get("ICARUS_EXTRACTION_MAX_TOKENS", "4096"))
 
 
 def _resolve_llm_endpoint() -> str:
@@ -1535,7 +1539,22 @@ def _llm_extract_entries(transcript):
         )
         resp = urllib.request.urlopen(req, timeout=45)
         body = json.loads(resp.read().decode("utf-8"))
-        raw = body["choices"][0]["message"]["content"]
+        choice = body["choices"][0]
+        raw = choice["message"]["content"]
+
+        # A truncated reply is worse than no reply: `_parse_json_robust` still
+        # recovers a *prefix* of the array, so an entry cut mid-sentence gets
+        # stored as if it were complete. That is how six 1024-char facts with
+        # identical openings and dangling endings appeared in the store.
+        # `finish_reason == "length"` means the model hit the token ceiling.
+        if choice.get("finish_reason") == "length":
+            logger.warning(
+                "icarus: extraction truncated at %s tokens (finish_reason=length) "
+                "— discarding %d chars of partial output rather than storing it",
+                _EXTRACTION_MAX_TOKENS,
+                len(raw or ""),
+            )
+            return []
 
         # Parse JSON from response (robust — handles markdown fences, null)
         if raw is None:
