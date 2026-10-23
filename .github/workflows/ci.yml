@@ -41,6 +41,12 @@ jobs:
       - name: CJK Chinese support regression tests (42 checks)
         run: python _test_cjk.py
 
+      - name: Icarus plugin fixes (yaml backend, retriever, export, index)
+        run: python icarus/test_icarus_fixes.py
+
+      - name: Rollback safety (.env keys must survive a model rollback)
+        run: python icarus/test_rollback_safety.py
+
       - name: Fact store self-evolution loop selftest
         run: python icarus/evolution.py --selftest
 

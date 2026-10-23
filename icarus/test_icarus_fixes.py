@@ -15,12 +15,26 @@ import tempfile
 import traceback
 from pathlib import Path
 
-sys.path.insert(0, "/home/xc/.hermes/hermes-agent")
-import hermes_bootstrap  # noqa: F401
+# Plugin under test. Default: the package next to this file, so the suite runs
+# on any checkout. ICARUS_PLUGIN_DIR points it at a live install instead, which
+# is how a bug that only reproduces under the Hermes runtime is reproduced.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PLUGIN_DIR = Path(os.environ.get("ICARUS_PLUGIN_DIR") or (REPO_ROOT / "icarus")).resolve()
+
+# The Hermes runtime ships ruamel.yaml, not PyYAML, which is the whole reason
+# icarus/_yaml.py exists. Its bootstrap puts that runtime's site-packages on
+# sys.path when this suite runs under the Hermes interpreter; everywhere else
+# it is simply absent and the PyYAML backend is exercised instead.
+_hermes_agent = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")) / "hermes-agent"
+if (_hermes_agent / "hermes_bootstrap.py").is_file():
+    sys.path.insert(0, str(_hermes_agent))
+    try:
+        import hermes_bootstrap  # noqa: F401
+    except Exception:  # pragma: no cover - bootstrap is optional
+        pass
 
 import importlib.util
 
-PLUGIN_DIR = Path("/home/xc/.hermes/plugins/icarus")
 _spec = importlib.util.spec_from_file_location(
     "icarus", str(PLUGIN_DIR / "__init__.py"), submodule_search_locations=[str(PLUGIN_DIR)]
 )
@@ -30,7 +44,7 @@ _spec.loader.exec_module(_mod)
 
 from icarus import _yaml, evolution, parsing, state  # noqa: E402
 
-SCRATCH = Path("/home/xc/.hermes/cache/scratch")
+SCRATCH = os.environ.get("ICARUS_TEST_SCRATCH") or None
 PASS, FAIL = [], []
 
 

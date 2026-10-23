@@ -7,12 +7,21 @@ import tempfile
 import time
 from pathlib import Path
 
-sys.path.insert(0, "/home/xc/.hermes/hermes-agent")
-import hermes_bootstrap  # noqa: F401
+# Plugin under test. Default: the package next to this file, so the suite runs
+# on any checkout. ICARUS_PLUGIN_DIR points it at a live install instead.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PLUGIN_DIR = Path(os.environ.get("ICARUS_PLUGIN_DIR") or (REPO_ROOT / "icarus")).resolve()
+
+_hermes_agent = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")) / "hermes-agent"
+if (_hermes_agent / "hermes_bootstrap.py").is_file():
+    sys.path.insert(0, str(_hermes_agent))
+    try:
+        import hermes_bootstrap  # noqa: F401
+    except Exception:  # pragma: no cover - bootstrap is optional
+        pass
 
 import importlib.util
 
-PLUGIN_DIR = Path("/home/xc/.hermes/plugins/icarus")
 spec = importlib.util.spec_from_file_location(
     "icarus", str(PLUGIN_DIR / "__init__.py"), submodule_search_locations=[str(PLUGIN_DIR)]
 )
@@ -30,7 +39,7 @@ def check(label, cond, detail=""):
     print(f"  [{'PASS' if cond else 'FAIL'}] {label}" + (f"  ({detail})" if detail and not cond else ""))
 
 
-home = Path(tempfile.mkdtemp(prefix="rb_", dir="/home/xc/.hermes/cache/scratch"))
+home = Path(tempfile.mkdtemp(prefix="rb_", dir=os.environ.get("ICARUS_TEST_SCRATCH") or None))
 real_home = state.HERMES_HOME
 state.HERMES_HOME = home
 try:
@@ -41,8 +50,8 @@ try:
                 "# live config",
                 "LLM_MODEL=new-model",
                 "LLM_API_BASE=http://new/v1",
-                "EMBEDDING_API_KEY=sk-embedding-should-survive",
-                "LLM_API_KEY=sk-llm-should-survive",
+                "EMBEDDING_API_KEY=test-live-embedding-key",
+                "LLM_API_KEY=test-live-llm-key",
                 "QDRANT_URL=http://localhost:6333",
                 "UNRELATED_KEY=keep-me",
                 "",
@@ -56,8 +65,8 @@ try:
             [
                 "LLM_MODEL=old-model",
                 "LLM_API_BASE=http://old/v1",
-                "EMBEDDING_API_KEY=sk-stale-backup-value",
-                "LLM_API_KEY=sk-stale-llm-key",
+                "EMBEDDING_API_KEY=test-stale-backup-key",
+                "LLM_API_KEY=test-stale-llm-key",
                 "",
             ]
         ),
@@ -79,12 +88,12 @@ try:
     check("UNRELATED_KEY preserved", "UNRELATED_KEY=keep-me" in live, live[:400])
     check(
         "embedding key NOT taken from the stale backup",
-        "sk-stale-backup-value" not in live,
+        "test-stale-backup-key" not in live,
         live[:400],
     )
     check(
         "live embedding key preserved",
-        "sk-embedding-should-survive" in live,
+        "test-live-embedding-key" in live,
         live[:400],
     )
     check("safety copy written", Path(result.get("safety_copy", "")).exists(), result.get("safety_copy", ""))
@@ -103,7 +112,7 @@ try:
                 "LLM_MODEL=old-model",
                 "LLM_API_BASE=http://old/v1",
                 "LLM_LIVE_ONLY=http://live-only/v1",
-                "EMBEDDING_API_KEY=sk-embedding-should-survive",
+                "EMBEDDING_API_KEY=test-live-embedding-key",
                 "KEEP_ME=1",
                 "",
             ]
@@ -128,7 +137,7 @@ try:
         json.dumps(fourth)[:300],
     )
     check("unmanaged neighbour key survives", "KEEP_ME=1" in after_text)
-    check("embedding key still survives", "sk-embedding-should-survive" in after_text)
+    check("embedding key still survives", "test-live-embedding-key" in after_text)
     check("no key disappeared", after_keys == before_keys, sorted(before_keys ^ after_keys))
 
     print()
@@ -138,7 +147,7 @@ try:
     check("refuses a backup with no model keys", "error" in third, json.dumps(third))
     check(
         "live .env untouched by the refused rollback",
-        "sk-embedding-should-survive" in env.read_text(),
+        "test-live-embedding-key" in env.read_text(),
     )
 finally:
     state.HERMES_HOME = real_home
