@@ -8,11 +8,14 @@ interpreter, because the yaml-shadowing bug only reproduces there.
 """
 
 import json
+import logging
 import os
 import shutil
 import sys
 import tempfile
 import traceback
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 # Plugin under test. Default: the package next to this file, so the suite runs
@@ -335,6 +338,169 @@ check(
     "deep match survives into the excerpt",
     "token" in _ex2,
     repr(_ex2[-60:]),
+)
+
+# ── 11b. excerpt must anchor on the DENSEST hit window, not the earliest ──
+# min(positions) anchors on the first place ANY term appears. A CJK query is
+# split into bigrams ("修好" "代码" "文件") and common bigrams appear all over a
+# long multi-section fact, so the earliest hit is routinely an unrelated
+# paragraph while the section that actually answers the query sits 400 chars
+# later. Measured on the live store: 7 of 304 (query, fact) pairs had <40% of
+# the query's hits inside the excerpt; the worst was 12% — the model was shown
+# a PAT-token warning when asked where the fixed code files were.
+print("\n11b. excerpt anchors on the densest window")
+
+# Shaped like the real fact that exposed this (fact 29 on the live store):
+# a common bigram appears once in an early unrelated section, while the
+# section that actually answers the query sits ~270 chars later.
+_dense = (
+    "## Decision\n"
+    + "这里有代码两个字但无关。"
+    + "无关段落。" * 50
+    + "\n## Result\n"
+    + "修好了。代码在 patch.py，文件已提交，文件清单如下，文件路径 ~/x，代码行数 42。\n"
+)
+_dense_terms = ["修好", "代码", "文件"]
+_dense_ex = hooks._fact_excerpt(_dense, _dense_terms, 200)
+_dense_hits = sum(_dense_ex.count(t) for t in _dense_terms)
+_dense_all = sum(_dense.count(t) for t in _dense_terms)
+check(
+    "densest window beats the earliest hit",
+    _dense_hits >= 5,
+    f"{_dense_hits}/{_dense_all} hits kept: {_dense_ex!r}",
+)
+
+# The Result section (where the answer lives) must be inside the window.
+check(
+    "the answering section is inside the window",
+    "修好了" in _dense_ex,
+    repr(_dense_ex[:100]),
+)
+
+# ── 11c. excerpt must not cut mid-word ────────────────────────────────────
+# start/end were raw character offsets, so 15% of excerpts began or ended in
+# the middle of a token: "Action/Decision" arrived as "tion/Decision",
+# "Provider" as "Prov", "USER.md" as "SER.md". Fragments are noise in the
+# prompt and poison the token-overlap feedback scorer.
+print("\n11c. excerpt boundaries snap to word/section edges")
+
+# The real symptom: "Action/Decision" arrived as "tion/Decision", "Provider" as
+# "Prov", "USER.md" as "SER.md". start/end were raw character offsets with no
+# alignment, so the cut landed inside tokens. Shaped like a real fact: multi-line
+# markdown with paths, ASCII tokens and CJK punctuation.
+_cut = (
+    "## Context\n"
+    "用户要求把 memory-os 完整接入 Hermes。安装副本位于 ~/.hermes/memory-os，"
+    "工作副本在 ~/.hermes/repos/memory-os-magic。\n\n"
+    "## Action/Decision\n"
+    "逐一排查并修复：yaml 后端缺失导致 frontmatter 解析失败；"
+    "export 子命令不传 --fabric-dir 导致子进程找不到目录；\n"
+    "rollback 直接整体替换 .env 会覆盖用户自定义配置。\n\n"
+    "## Result\n"
+    "修好了。三个补丁已提交，回归测试 57 项全过。代码文件在 icarus/hooks.py，"
+    "文件清单见 git log，路径是 ~/.hermes/repos/memory-os-magic。\n"
+)
+_cut_ex = hooks._fact_excerpt(_cut, ["修好", "代码", "文件"], 200)
+_core = _cut_ex.lstrip("…").rstrip("…")
+_idx = _cut.find(_core)
+check("excerpt is a real slice of the fact", _idx != -1, repr(_core[:40]))
+
+# A start/end is clean when the character just outside it is a boundary: the
+# excerpt must never resume in the middle of a token. This is the actual
+# invariant — "frontmatter" starting an excerpt is fine, "rontmatter" is not.
+_BOUNDARY = set(" \t\n\u3002\uff1b\uff1a\uff0c\u3001\uff08\uff09`*|-/\\")
+if _idx > 0:
+    check(
+        "head sits on a token boundary",
+        _cut[_idx - 1] in _BOUNDARY,
+        f"preceded by {_cut[_idx - 1]!r}",
+    )
+_end_idx = _idx + len(_core)
+if _end_idx < len(_cut):
+    check(
+        "tail sits on a token boundary",
+        _cut[_end_idx] in _BOUNDARY,
+        f"followed by {_cut[_end_idx]!r}",
+    )
+check(
+    "no ASCII token is sliced mid-word",
+    not any(
+        _core.startswith(frag)
+        for frag in ("tion/", "cision", "Prov", "SER.md", "ider", "rontmatter", "eader")
+    ),
+    repr(_core[:40]),
+)
+
+# ── 11d. extraction failures must log the HTTP status, not just the class ──
+# HTTPError subclasses URLError, so logging ``type(e).__name__`` recorded 400,
+# 401, 404 and 413 identically as "HTTPError". 15 consecutive failures in the
+# live log were unreadable; distinguishing them is the difference between
+# "unknown model ID", "bad key" and "wrong base URL".
+print("\n11d. extraction failure logs carry the status code")
+
+
+class _FakeHTTPError(urllib.error.HTTPError):
+    def __init__(self, code, body):
+        super().__init__("http://x/v1/chat/completions", code, "err", {}, None)
+        self._body = body.encode()
+
+    def read(self, amt=None):
+        return self._body
+
+
+_cls = []
+
+
+class _Cap(logging.Handler):
+    def emit(self, record):
+        _cls.append(record.getMessage())
+
+
+def _extract_with_failure(code, body):
+    """Drive the real _llm_extract_entries with urlopen forced to fail."""
+    _cls.clear()
+    logger = logging.getLogger("icarus.hooks")
+    handler = _Cap()
+    logger.addHandler(handler)
+    prev = logger.level
+    logger.setLevel(logging.WARNING)
+    real_urlopen = urllib.request.urlopen
+    real_key = os.environ.get("LLM_API_KEY")
+
+    def _boom(*a, **k):
+        raise _FakeHTTPError(code, body)
+
+    try:
+        os.environ["LLM_API_KEY"] = real_key or "test-key"
+        # Module globals are read at import; force the resolved key so the call
+        # reaches urlopen instead of the "no API key" early return.
+        _saved_key = hooks._LLM_API_KEY
+        hooks._LLM_API_KEY = "test-key"
+        urllib.request.urlopen = _boom
+        try:
+            hooks._llm_extract_entries("user: hi\nassistant: hello there this is long enough")
+        finally:
+            hooks._LLM_API_KEY = _saved_key
+    finally:
+        urllib.request.urlopen = real_urlopen
+        if real_key is None:
+            os.environ.pop("LLM_API_KEY", None)
+        logger.removeHandler(handler)
+        logger.setLevel(prev)
+    return list(_cls)
+
+
+_msgs_400 = _extract_with_failure(400, '{"error":{"message":"model not found"}}')
+_msgs_404 = _extract_with_failure(404, "no credentials for provider")
+check(
+    "400 is distinguishable from 404 in the log",
+    any("HTTP 400" in m for m in _msgs_400) and any("HTTP 404" in m for m in _msgs_404),
+    f"{_msgs_400} / {_msgs_404}",
+)
+check(
+    "the provider's message rides along",
+    any("model not found" in m for m in _msgs_400),
+    str(_msgs_400),
 )
 
 # ── 12. extraction must not re-consume the whole transcript ───────────────

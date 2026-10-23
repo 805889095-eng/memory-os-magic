@@ -715,13 +715,25 @@ def _query_words(query: str):
 
 
 def _fact_excerpt(content: str, terms, width: int = 200) -> str:
-    """Excerpt of ``content`` centred on the earliest query-term hit.
+    """Excerpt of ``content`` over the window with the most query-term hits.
 
     A head slice is wrong for a fact store: entries are multi-section markdown
     (## Context / ## Decision / ...), and the query terms frequently land past
     offset 200. The excerpt is what gets injected AND what the collapse ranker
     scores for query overlap, so a head slice with no query terms made every
     fact candidate look like noise (overlap 0.0) and get pruned.
+
+    Anchoring on the EARLIEST hit is also wrong. A CJK query is split into
+    bigrams ("修好" "代码" "文件") and common bigrams appear throughout a long
+    fact, so the first hit is routinely an unrelated paragraph while the
+    section that answers the query sits hundreds of chars later. On the live
+    store 7 of 304 (query, fact) pairs kept <40% of the query's hits, the worst
+    at 12%: asked where the fixed code files were, the model was shown a
+    PAT-token warning. So every hit is tried as a window centre and the window
+    covering the most DISTINCT terms wins (total hits break the tie).
+
+    Boundaries snap outward to whitespace / a ``## `` section head so the
+    excerpt never starts or ends mid-token ("tion/Decision", "Prov", "SER.md").
 
     Falls back to the head slice when no term is present (short facts, or an
     FTS hit produced by a stem the caller did not pass).
@@ -731,28 +743,113 @@ def _fact_excerpt(content: str, terms, width: int = 200) -> str:
         return text
 
     lowered = text.lower()
-    positions = []
+    hits = []  # (position, term)
     for term in terms or ():
         term = str(term or "").strip()
         if not term:
             continue
-        idx = lowered.find(term.lower())
-        if idx != -1:
-            positions.append(idx)
+        needle = term.lower()
+        pos = lowered.find(needle)
+        while pos != -1:
+            hits.append((pos, term))
+            pos = lowered.find(needle, pos + 1)
 
-    if not positions:
+    if not hits:
         return text[:width]
+    hits.sort()
 
-    # Keep a quarter of the window as leading context so the excerpt does not
-    # start mid-word, then clamp to the tail when the hit is near the end.
-    start = max(0, min(positions) - width // 4)
-    end = start + width
-    if end > len(text):
-        end = len(text)
-        start = max(0, end - width)
+    # Pick the window covering the most distinct terms; total hits break ties.
+    best_score, best_start, best_end = None, 0, width
+    for centre, _ in hits:
+        start = max(0, centre - width // 4)
+        end = min(len(text), start + width)
+        if end - start < width:
+            start = max(0, end - width)
+        in_window = [(p, t) for p, t in hits if start <= p < end]
+        score = (len({t for _, t in in_window}), len(in_window))
+        if best_score is None or score > best_score:
+            best_score, best_start, best_end = score, start, end
+
+    # Snapping must never move an edge past the hits that justify the window.
+    in_window = [p for p, _ in hits if best_start <= p < best_end]
+    keep_from = min(in_window)
+    keep_to = max(in_window) + 1
+    start, end = _snap_excerpt_bounds(
+        text, best_start, best_end, width, keep_from, keep_to
+    )
     prefix = "…" if start > 0 else ""
     suffix = "…" if end < len(text) else ""
     return f"{prefix}{text[start:end]}{suffix}"
+
+
+_EXCERPT_BREAKS = ("\n", " ", "\t", "\u3002", "\uff1b", "\uff1a", "\uff0c", "\u3001")
+
+
+def _snap_excerpt_bounds(
+    text: str, start: int, end: int, width: int, keep_from: int, keep_to: int
+) -> tuple:
+    """Move a window's edges onto clean boundaries without losing the hits.
+
+    The head searches FORWARD from ``start`` (bounded by ``keep_from`` so the
+    first hit is never clipped) for a ``## `` section head, then a line break /
+    CJK sentence punctuation, then any space. The tail searches FORWARD from
+    ``keep_to`` — one past the last hit — for the same boundaries, which is what
+    keeps a hit near the window edge from forcing a mid-token cut: the window is
+    allowed to grow by up to ``width // 8`` rather than truncate a word. Failing
+    a boundary, a partial ASCII token is dropped.
+
+    Never returns an empty or inverted range.
+    """
+    limit = max(1, width // 8)
+
+    if start > 0:
+        floored = max(0, min(keep_from, end - 1))
+        snapped = None
+        for offset in range(limit + 1):
+            i = start + offset
+            if i >= end or i > floored:
+                break
+            if text.startswith("## ", i) or text[i - 1 : i] in _EXCERPT_BREAKS:
+                snapped = i
+                break
+        if snapped is None:
+            snapped = start
+            while (
+                snapped < end
+                and snapped <= floored
+                and snapped - start <= limit
+                and text[snapped - 1 : snapped].isascii()
+                and (
+                    text[snapped - 1 : snapped].isalnum()
+                    or text[snapped - 1 : snapped] in "_-/."
+                )
+            ):
+                snapped += 1
+        start = snapped
+
+    if end < len(text):
+        # Grow past the last hit to a clean edge instead of cutting a token.
+        tail_from = max(end, keep_to)
+        ceiling = min(len(text), tail_from + limit)
+        snapped = None
+        for i in range(tail_from, ceiling + 1):
+            if text.startswith("## ", i) or text[i - 1 : i] in _EXCERPT_BREAKS:
+                snapped = i
+                break
+        if snapped is None:
+            snapped = min(len(text), tail_from)
+            while (
+                snapped < ceiling
+                and text[snapped : snapped + 1].isascii()
+                and (
+                    text[snapped : snapped + 1].isalnum()
+                    or text[snapped : snapped + 1] in "_-/."
+                )
+            ):
+                snapped += 1
+        end = snapped
+
+    return start, end
 
 
 def _search_facts(query, top_k=3):
@@ -1707,10 +1804,29 @@ def _llm_extract_entries(transcript):
         TimeoutError,
         OSError,
     ) as e:
-        logger.warning(
-            "icarus: LLM extraction failed (%s) — falling back to legacy",
-            type(e).__name__,
-        )
+        # HTTPError is a URLError subclass, so a bare ``type(e).__name__``
+        # records every status as the same "HTTPError" — 400 (unknown model),
+        # 401 (bad key), 404 (wrong base URL) and 413 (payload too big) were
+        # indistinguishable in the log, which sent a whole debugging session
+        # down the wrong path. Include the status code and the body's first
+        # line; both are provider responses, not credentials.
+        if isinstance(e, urllib.error.HTTPError):
+            detail = f"HTTP {e.code}"
+            try:
+                body = (e.read() or b"")[:200].decode("utf-8", "replace").strip()
+                if body:
+                    detail += f" {body.splitlines()[0][:160]}"
+            except Exception:
+                pass
+            logger.warning(
+                "icarus: LLM extraction failed (%s) — falling back to legacy", detail
+            )
+        else:
+            logger.warning(
+                "icarus: LLM extraction failed (%s: %s) — falling back to legacy",
+                type(e).__name__,
+                str(e)[:160],
+            )
         return []
 
 
