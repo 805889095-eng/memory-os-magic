@@ -316,6 +316,79 @@ finally:
     else:
         sys.modules["scripts"] = saved
 
+# [10] Fact-store LIKE path must apply the same precision gate as sessions.
+# Without it, OR-ing bare bigrams accepts any fact sharing ONE common word:
+# "完全不存在的话题xyz" matched a real fact through "%完全%" alone. The
+# sessions path already gates on `need = len(terms)//2`; the facts path did not.
+print("\n[10] _search_facts precision gate on the CJK LIKE path")
+
+import sqlite3 as _sqlite3
+import tempfile as _tf
+import pathlib as _pl
+
+_fdir = _pl.Path(_tf.mkdtemp())
+_fdb_path = _fdir / "memory_store.db"
+_con = _sqlite3.connect(str(_fdb_path))
+_con.executescript(
+    """
+    CREATE TABLE facts (
+        fact_id INTEGER PRIMARY KEY, content TEXT, trust_score REAL,
+        retrieval_count INTEGER, helpful_count INTEGER,
+        created_at TEXT, updated_at TEXT
+    );
+    CREATE VIRTUAL TABLE facts_fts USING fts5(content, content='facts',
+                                              content_rowid='fact_id');
+    """
+)
+_rows = [
+    (1, "查了完全没关系的资料", "2026-10-20T00:00:00Z"),
+    (2, "worker 反思把矛盾标出来了", "2026-10-20T00:00:00Z"),
+    (3, "redis 队列没有落盘", "2026-10-20T00:00:00Z"),
+]
+_con.executemany(
+    "INSERT INTO facts VALUES (?,?,0.55,0,0,?,?)",
+    [(fid, c, ts, ts) for fid, c, ts in _rows],
+)
+_con.executemany(
+    "INSERT INTO facts_fts(rowid, content) VALUES (?,?)",
+    [(fid, c) for fid, c, _ in _rows],
+)
+_con.commit()
+_con.close()
+
+_orig_candidates = H._facts_db_candidates
+H._facts_db_candidates = lambda: [_fdb_path]
+try:
+    # The gate is a >=3-term protection. "完全不存在的量子纠缠话题" tokenizes
+    # to 11 bigrams (need=5); fact 3 shares only "完全" (1 hit) and must be
+    # rejected. Before the gate existed, that single common bigram was enough.
+    _noise = H._search_facts("完全不存在的量子纠缠话题", top_k=3)
+    check(
+        f"multi-term noise query rejected at need=5 (got {[x['fact_id'] for x in _noise]})",
+        _noise == [],
+    )
+
+    # A short noise query is still permissive: need = max(1, 2//2) = 1, so one
+    # shared common bigram passes. Documented limitation, identical to the
+    # sessions layer — bigrams have no IDF, so a common word carries a short
+    # query all by itself.
+    _short = H._search_facts("完全不存在的话题", top_k=3)
+    check(
+        f"short noise query still leaks at need=1 (documented, got {[x['fact_id'] for x in _short]})",
+        [x["fact_id"] for x in _short] == [1],
+    )
+
+    _real = H._search_facts("worker 反思矛盾", top_k=3)
+    check(
+        f"relevant fact still returns (got {[x['fact_id'] for x in _real]})",
+        any(x["fact_id"] == 2 for x in _real),
+    )
+
+finally:
+    H._facts_db_candidates = _orig_candidates
+    import shutil as _sh
+    _sh.rmtree(_fdir, ignore_errors=True)
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print()
 print(f"=== {_checks['pass']} passed, {_checks['fail']} failed ===")

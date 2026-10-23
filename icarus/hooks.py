@@ -744,15 +744,28 @@ def _search_facts(query, top_k=3):
             # and its trigram tokenizer requires >= 3 characters, which excludes
             # "部署"/"规范". Neither can find "端口" inside
             # "帮我看看这个部署规范"; LIKE '%部署%' can.
+            hits_expr = " + ".join(
+                "(CASE WHEN content LIKE ? THEN 1 ELSE 0 END)" for _ in cjk_terms
+            )
             clauses = " OR ".join(["content LIKE ?"] * len(cjk_terms))
+            wildcards = [f"%{t}%" for t in cjk_terms]
             rows = cur.execute(
-                f"SELECT f.* FROM facts f WHERE ({clauses}) LIMIT ?",
-                [f"%{t}%" for t in cjk_terms] + [fetch_k],
+                f"SELECT f.*, ({hits_expr}) AS _hits FROM facts f "
+                f"WHERE ({clauses}) LIMIT ?",
+                wildcards + wildcards + [fetch_k],
             ).fetchall()
         con.close()
     except Exception as e:
         logger.debug("icarus: fact search failed (%s)", e)
         return []
+
+    # Precision gate for the LIKE path, mirroring _query_messages. OR-ing bare
+    # bigrams accepts any fact sharing one common word: "完全不存在的话题xyz"
+    # matched a real fact through "%完全%" alone. FTS rows get the gate for free
+    # (BM25), so it only applies when the CJK path ran.
+    if not ascii_query and cjk_terms:
+        need = max(1, len(cjk_terms) // 2)
+        rows = [r for r in rows if (r["_hits"] or 0) >= need]
 
     scored = []
     for r in rows:
