@@ -48,9 +48,20 @@ def parse_entry(filepath):
         return None
     meta = {}
     try:
-        import yaml
-        meta = yaml.safe_load(parts[1]) or {}
+        from . import _yaml as _helper
+    except ImportError:
+        import _yaml as _helper
+    # ``_yaml`` resolves hermes_yaml (ruamel, always present in a Hermes
+    # runtime) before falling back to PyYAML. A bare ``import yaml`` used to
+    # fail here, dropping every entry into the manual fallback below, which
+    # left quoted values quoted ("high" instead of high) and lists unparsed.
+    try:
+        parsed = _helper.safe_load(parts[1])
     except Exception:
+        parsed = None
+    if isinstance(parsed, dict) and parsed:
+        meta = parsed
+    else:
         current_key = None
         for line in parts[1].strip().split("\n"):
             stripped = line.strip()
@@ -65,7 +76,7 @@ def parse_entry(filepath):
                 if v.startswith("[") and v.endswith("]"):
                     meta[k] = [x.strip().strip("\"'") for x in v[1:-1].split(",") if x.strip()]
                 elif v.strip():
-                    meta[k] = v.strip()
+                    meta[k] = v.strip().strip("\"'")
                 else:
                     meta[k] = []
             elif stripped.endswith(":") and not stripped.startswith("-"):

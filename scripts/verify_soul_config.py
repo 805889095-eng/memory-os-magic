@@ -59,7 +59,7 @@ CHECKS = {
         "marker": MEMORY_OS_MARKER,
         "keywords": [
             "**Deprecated:**",
-            "abandoned as external memory",
+            "abandoned as an external memory",
         ],
         "fix_hint": (
             "Add the Honcho deprecation notice from "

@@ -76,9 +76,21 @@ def _ensure_fabric_index(fabric_dir: Path) -> sqlite3.Connection:
     table was never populated or queried (no INSERT/MATCH existed anywhere in
     the tree), so it is dropped here and its dead code removed; ranking is done
     entirely by the Python scorer in retrieve().
-    Rebuilds the index when any fabric .md file has an mtime newer than
-    the latest stored mtime. Uses a transaction so a partial rebuild
-    won't leave the index inconsistent.
+
+    Freshness is decided on a *fingerprint* of the fabric directory, not on
+    "newest file mtime vs newest indexed mtime". The mtime rule silently kept
+    stale rows forever:
+
+    * a deleted entry stayed searchable (no file is newer than the index, so no
+      rebuild ever triggered),
+    * a retrieval against a *different* FABRIC_DIR (tests, multiple profiles)
+      reused whatever the previous directory had indexed,
+    * two files written inside the same filesystem-timestamp tick could leave
+      one of them unindexed.
+
+    The fingerprint hashes every ``(relative path, mtime, size)`` plus the
+    resolved directory, so add / edit / delete / directory-switch all rebuild.
+    A rebuild is a full table rewrite inside one transaction.
     """
     try:
         STATE_DB.parent.mkdir(parents=True, exist_ok=True)
@@ -104,68 +116,78 @@ def _ensure_fabric_index(fabric_dir: Path) -> sqlite3.Connection:
             mtime      REAL NOT NULL,
             file_path  TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS fabric_index_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
         DROP TABLE IF EXISTS fabric_fts;
     """)
     conn.commit()
 
-    # Check freshness
-    latest_db_mtime = conn.execute(
-        "SELECT COALESCE(MAX(mtime), 0) FROM fabric_index"
-    ).fetchone()[0]
-
-    latest_fs_mtime = 0.0
+    files = []
     for d in (fabric_dir, fabric_dir / "cold"):
         try:
-            for f in d.glob("*.md"):
-                mtime = f.stat().st_mtime
-                if mtime > latest_fs_mtime:
-                    latest_fs_mtime = mtime
+            for f in sorted(d.glob("*.md")):
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                files.append((str(f), f.relative_to(fabric_dir).as_posix(), st.st_mtime, st.st_size))
         except OSError:
             pass
 
-    if latest_fs_mtime <= latest_db_mtime:
-        return conn  # index is fresh
+    fingerprint = hashlib.sha1(
+        "\n".join(
+            [f"dir:{fabric_dir.resolve()}"] + [f"{rel}|{mtime:.6f}|{size}" for _, rel, mtime, size in files]
+        ).encode("utf-8")
+    ).hexdigest()
 
-    # Rebuild in a transaction
+    row = conn.execute(
+        "SELECT value FROM fabric_index_meta WHERE key = 'fingerprint'"
+    ).fetchone()
+    if row is not None and row[0] == fingerprint:
+        return conn  # index is fresh for this directory and these files
+
     conn.execute("BEGIN")
     conn.execute("DELETE FROM fabric_index")
-    for d in (fabric_dir, fabric_dir / "cold"):
+    for full_path, rel_path, mtime, _size in files:
         try:
-            for f in d.glob("*.md"):
-                e = parse_entry(f)
-                if not e:
-                    continue
-                rel_path = str(f.relative_to(fabric_dir))
-                mtime = f.stat().st_mtime
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO fabric_index
-                    (entry_id, agent, type, title, body, timestamp,
-                     tags, project, tier, status, assigned_to, refs,
-                     mtime, file_path)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                    (
-                        f"{e.get('agent', '')}:{e.get('id', '')}",
-                        e.get("agent", ""),
-                        e.get("type", ""),
-                        _entry_title(e),
-                        e.get("_body", ""),
-                        e.get("timestamp", ""),
-                        # Frontmatter tags/refs are commonly YAML lists; a list
-                        # cannot be bound to a TEXT column, so normalise first.
-                        _as_text(e.get("tags", "")),
-                        _as_text(e.get("project_id", e.get("project", ""))),
-                        e.get("tier", ""),
-                        e.get("status", ""),
-                        _as_text(e.get("assigned_to", "")),
-                        _as_text(e.get("refs", "")),
-                        mtime,
-                        rel_path,
-                    ),
-                )
-        except OSError:
-            pass
+            e = parse_entry(Path(full_path))
+        except Exception:
+            continue
+        if not e:
+            continue
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO fabric_index
+            (entry_id, agent, type, title, body, timestamp,
+             tags, project, tier, status, assigned_to, refs,
+             mtime, file_path)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+            (
+                f"{e.get('agent', '')}:{e.get('id', '')}",
+                e.get("agent", ""),
+                e.get("type", ""),
+                _entry_title(e),
+                e.get("_body", ""),
+                e.get("timestamp", ""),
+                # Frontmatter tags/refs are commonly YAML lists; a list
+                # cannot be bound to a TEXT column, so normalise first.
+                _as_text(e.get("tags", "")),
+                _as_text(e.get("project_id", e.get("project", ""))),
+                e.get("tier", ""),
+                e.get("status", ""),
+                _as_text(e.get("assigned_to", "")),
+                _as_text(e.get("refs", "")),
+                mtime,
+                rel_path,
+            ),
+        )
+    conn.execute(
+        "INSERT OR REPLACE INTO fabric_index_meta (key, value) VALUES ('fingerprint', ?)",
+        (fingerprint,),
+    )
     conn.commit()
 
     return conn

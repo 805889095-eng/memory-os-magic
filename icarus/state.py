@@ -7,6 +7,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
 import urllib.request
 import urllib.error
@@ -398,23 +399,28 @@ def _yaml_scalar(value):
     return json.dumps(str(value))
 
 
-def _parse_frontmatter_scalar(text, key):
-    """Read a scalar frontmatter value and normalize quoted YAML strings."""
-    m = re.search(rf"^{key}: (.+)$", text, re.MULTILINE)
-    if not m:
-        return ""
-    raw = m.group(1).strip()
+def _yaml_module():
+    """Return the YAML helper, working under both package and path loading."""
     try:
-        import yaml as _yaml
+        from . import _yaml as helper
 
-        value = _yaml.safe_load(raw)
-    except Exception:
-        value = raw
-    if value is None:
-        return ""
-    if isinstance(value, list):
-        return ", ".join(str(v) for v in value)
-    return str(value)
+        return helper
+    except ImportError:
+        import _yaml as helper
+
+        return helper
+
+
+def _parse_frontmatter_scalar(text, key):
+    """Read a scalar frontmatter value and normalize quoted YAML strings.
+
+    Delegates to ``_yaml.load_scalar``, which resolves a YAML backend that
+    actually exists in a Hermes runtime. A bare ``import yaml`` here used to
+    fail there (Hermes ships ruamel, not PyYAML) and the fallback returned the
+    quoted text verbatim, so ``training_value: "high"`` compared unequal to
+    ``high`` in the report, the tier filter and every id lookup.
+    """
+    return _yaml_module().load_scalar(text, key)
 
 
 def write_entry(
@@ -538,7 +544,36 @@ def write_entry(
         except Exception as exc:
             logger.debug("icarus: obsidian formatting failed: %s", exc)
 
+    _sync_entry_to_qdrant(path)
     return str(path)
+
+
+def _sync_entry_to_qdrant(path):
+    """Mirror a freshly written entry into the Qdrant knowledge base.
+
+    Layer 5 only ever *read*; nothing wrote fabric into Qdrant, so the
+    ``[qdrant]`` prompt block stayed empty on every install without the
+    Redis/ARQ worker stack. This makes each write self-feeding.
+
+    Runs in a detached subprocess so an embedding round-trip never delays the
+    turn, and opts out with ``ICARUS_QDRANT_SYNC=0``. Failures are logged at
+    DEBUG only — the knowledge base is a cache, never the source of truth.
+    """
+    if os.environ.get("ICARUS_QDRANT_SYNC", "1").lower() in ("0", "false", "no", "off"):
+        return
+    script = HERMES_HOME / "memory-os" / "scripts" / "sync-fabric-to-qdrant.py"
+    if not script.is_file():
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, str(script), "--quiet"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,  # detach: survive this process's lifecycle
+            cwd=str(HERMES_HOME),
+        )
+    except Exception as exc:
+        logger.debug("icarus: qdrant sync spawn failed: %s", exc)
 
 
 def read_recent(agent="", limit=5):
@@ -758,6 +793,24 @@ _retriever = None
 
 
 def _load_retriever():
+    """Load ``fabric-retrieve.py`` as a submodule of this package.
+
+    ``fabric-retrieve.py`` starts with ``from .parsing import parse_entry`` and
+    keeps a bare ``from parsing import ...`` fallback for script mode. Loading
+    it as a *top-level* module (``fabric_retrieve``) satisfies neither: there is
+    no parent package for the relative import and the plugin directory is not on
+    ``sys.path`` for the bare one. Every attempt failed, ``_retriever`` stayed
+    ``None`` forever, and ``recall()`` silently degraded to ``read_recent`` —
+    the whole ranked-retrieval layer was dead while looking healthy.
+
+    Registering it under ``<package>.fabric_retrieve`` with the plugin directory
+    in ``submodule_search_locations`` makes ``from .parsing import ...`` resolve
+    exactly as it does for ``hooks.py``/``tools.py``.
+    """
+    import importlib.util
+    import sys
+
+    package = __package__ or "icarus"
     paths = [
         PLUGIN_DIR / "fabric-retrieve.py",
         Path(os.environ.get("FABRIC_RETRIEVE_PATH", "")),
@@ -765,17 +818,35 @@ def _load_retriever():
     if HERMES_HOME:
         paths.append(HERMES_HOME / "plugins" / "icarus" / "fabric-retrieve.py")
     for p in paths:
-        if p and p.exists():
-            try:
-                import importlib.util
-
-                spec = importlib.util.spec_from_file_location("fabric_retrieve", str(p))
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                mod.FABRIC_DIR = FABRIC_DIR
-                return mod
-            except Exception as exc:
-                logger.debug("icarus: retriever load failed from %s: %s", p, exc)
+        if not p or not p.exists():
+            continue
+        module_name = f"{package}.fabric_retrieve"
+        if module_name in sys.modules:
+            mod = sys.modules[module_name]
+            mod.FABRIC_DIR = FABRIC_DIR
+            return mod
+        plugin_dir = str(p.parent)
+        if plugin_dir not in sys.path:
+            sys.path.insert(0, plugin_dir)
+        try:
+            spec = importlib.util.spec_from_file_location(
+                module_name, str(p), submodule_search_locations=[plugin_dir]
+            )
+            if spec is None or spec.loader is None:
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = mod
+            spec.loader.exec_module(mod)
+            mod.FABRIC_DIR = FABRIC_DIR
+            return mod
+        except Exception as exc:
+            sys.modules.pop(module_name, None)
+            logger.warning("icarus: retriever load failed from %s: %s", p, exc)
+    logger.warning(
+        "icarus: ranked retrieval unavailable — fabric_recall falls back to "
+        "recency order (%d candidate path(s) tried)",
+        len(paths),
+    )
     return None
 
 
@@ -834,12 +905,26 @@ def export_training(mode="normal"):
         return {"error": "export-training.py not found"}
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        cmd = ["python3", str(export_script), "--output", tmpdir]
+        # ``--fabric-dir`` is mandatory in practice: the script defaults to
+        # ``~/fabric``, while Hermes keeps entries under ``$HERMES_HOME/fabric``.
+        # Without it the child process exited 1 with "does not exist" and every
+        # export call returned the generic "export failed".
+        # ``sys.executable`` (not "python3") so the child inherits the same
+        # interpreter and site-packages the plugin is running under.
+        cmd = [
+            sys.executable,
+            str(export_script),
+            "--output",
+            tmpdir,
+            "--fabric-dir",
+            str(FABRIC_DIR),
+        ]
         if mode != "normal":
             cmd.extend(["--mode", mode])
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
-            return {"error": result.stderr or "export failed"}
+            detail = (result.stderr or result.stdout or "").strip()
+            return {"error": f"export failed: {detail.splitlines()[-1] if detail else 'no output'}"}
 
         output = result.stdout
         pairs = 0
