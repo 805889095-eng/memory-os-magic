@@ -1348,39 +1348,119 @@ def switch_model(model_id, min_eval_score=0.7):
     }
 
 
+def _env_keys(path):
+    """Map of ``KEY -> line`` for a dotenv file (last occurrence wins)."""
+    out = {}
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").split("\n"):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key = stripped.split("=", 1)[0].strip()
+            if key:
+                out[key] = line
+    except OSError:
+        pass
+    return out
+
+
 def rollback_model():
-    """Restore .env from the newest backup and deactivate the current model."""
+    """Restore the previous model selection in .env, without dropping keys.
+
+    This used to be ``shutil.copy2(backup, env_file)``: the whole live .env was
+    replaced by a file that was merely the *newest* backup. Any key added after
+    that backup was silently destroyed — a routine "roll back the model" wiped
+    unrelated credentials (measured: nine Memory OS keys vanished, including the
+    embedding API key), and the call still reported ``status: rolled_back``.
+
+    Two guards now:
+
+    * **Only keys the rollback is allowed to touch are copied** (the model and
+      provider keys). Everything else in the live file is preserved verbatim.
+    * **A backup is created before writing**, so a rollback is itself undoable.
+
+    If the backup holds no model/provider key the call refuses with an error
+    instead of writing an identical file and claiming success.
+    """
     env_file = HERMES_HOME / ".env"
 
-    # Newest backup wins — the legacy fixed ".env.backup" name is still honoured
-    # so pre-upgrade deployments keep working.
     backup = _latest_env_backup()
     if backup is None:
         return {"error": "no .env.backup found — nothing to roll back to"}
 
-    # read what we're rolling back from
-    current_model = None
+    # Keys a model rollback is responsible for. Anything outside this set must
+    # never be rewritten by this function.
+    MANAGED_PREFIXES = ("LLM_MODEL", "LLM_API_BASE", "MODEL_", "HERMES_CUSTOM_")
+    MANAGED_EXACT = {"LLM_MODEL", "LLM_API_BASE"}
+
+    def managed(key):
+        return key in MANAGED_EXACT or key.startswith(MANAGED_PREFIXES)
+
+    current = _env_keys(env_file) if env_file.exists() else {}
+    previous = _env_keys(backup)
+
+    restorable = {k: v for k, v in previous.items() if managed(k)}
+    if not restorable:
+        return {
+            "error": (
+                f"backup {backup.name} contains no model/provider keys "
+                f"(expected one of {sorted(MANAGED_EXACT)} or a MODEL_/HERMES_CUSTOM_ key) "
+                "— refusing to overwrite .env"
+            )
+        }
+
+    before_model = current.get("LLM_MODEL", "")
+    after_model = restorable.get("LLM_MODEL", "")
+    if before_model == after_model and len(restorable) == sum(1 for k in current if managed(k)):
+        return {
+            "error": (
+                f"nothing to roll back: live .env already matches {backup.name} "
+                f"for model keys (LLM_MODEL={after_model or '<unset>'})"
+            )
+        }
+
+    # Snapshot the live file first so this operation is reversible.
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    safety = HERMES_HOME / f".env.prerollback.{stamp}"
     if env_file.exists():
-        for l in env_file.read_text("utf-8").split("\n"):
-            if l.startswith("LLM_MODEL="):
-                current_model = l.split("=", 1)[1].strip()
+        try:
+            shutil.copy2(env_file, safety)
+        except OSError as exc:
+            return {"error": f"cannot snapshot .env before rollback: {exc}"}
 
-    shutil.copy2(backup, env_file)
+    lines = env_file.read_text(encoding="utf-8").split("\n") if env_file.exists() else []
+    replaced = set()
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key in restorable:
+            lines[i] = restorable[key]
+            replaced.add(key)
+    appended = [v for k, v in restorable.items() if k not in replaced]
+    while lines and lines[-1] == "":
+        lines.pop()
+    lines.extend(appended)
+    lines.append("")
 
-    # read what we rolled back to
-    restored_model = None
-    for l in env_file.read_text("utf-8").split("\n"):
-        if l.startswith("LLM_MODEL="):
-            restored_model = l.split("=", 1)[1].strip()
+    tmp = env_file.with_suffix(".env.tmp")
+    tmp.write_text("\n".join(lines), encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    tmp.replace(env_file)
 
     # update registry
     registry = _load_registry()
     for m in registry["models"]:
         if m.get("active"):
             m["active"] = False
+    restored_model = restorable.get("LLM_MODEL", "").split("=", 1)[-1] if restorable.get("LLM_MODEL") else None
     restored_match = None
     for m in registry["models"]:
-        if m.get("output_model") == restored_model:
+        if restored_model and m.get("output_model") == restored_model:
             m["active"] = True
             restored_match = restored_model
     registry["active_model"] = restored_match
@@ -1388,8 +1468,11 @@ def rollback_model():
 
     return {
         "status": "rolled_back",
-        "from_model": current_model,
+        "from_model": before_model.split("=", 1)[-1] if before_model else None,
         "to_model": restored_model,
+        "keys_restored": sorted(replaced | set(appended)),
+        "keys_preserved": sorted(k for k in current if k not in restorable),
+        "safety_copy": str(safety),
     }
 
 
