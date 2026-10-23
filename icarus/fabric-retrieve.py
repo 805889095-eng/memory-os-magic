@@ -302,9 +302,34 @@ HANDOFF_WORDS = {
 }
 
 
+def _cjk_module():
+    """Import the shared CJK tokenizer from either script or package context.
+
+    This file runs both as ``python3 fabric-retrieve.py`` (loaded by
+    ``state._load_retriever`` via importlib) and potentially as a package module,
+    so the import has to work without a guaranteed parent package.
+    """
+    try:
+        import cjk_tokens
+    except ImportError:
+        from . import cjk_tokens
+    return cjk_tokens
+
+
+def _cjk_sequence(text):
+    """Ordered CJK-aware token sequence (see cjk_tokens.token_sequence)."""
+    return _cjk_module().token_sequence(text)
+
+
 def tokenize(text):
-    words = set(re.findall(r"[a-z0-9]+", text.lower()))
-    return words - STOP_WORDS
+    """CJK-aware tokens: ASCII words minus STOP_WORDS + Han bigrams.
+
+    The local ASCII-only regex scored every Chinese fabric entry at 0.0 against
+    a Chinese query, so ``state.recall`` (which reaches this module via
+    ``_load_retriever``) only ever returned ``read_recent`` fallbacks for CJK
+    users.
+    """
+    return _cjk_module().tokenize(text, stopwords=STOP_WORDS)
 
 
 def _ngrams(tokens, n):
@@ -356,10 +381,14 @@ def score_entry(entry, query_tokens, agent=None, project=None, relevant_refs=Non
     entry_tokens = tokenize(body)
     summary_tokens = tokenize(summary_lower)
     entry_type = entry.get("type", "")
-    query_text = " ".join(re.findall(r"[a-z0-9]+", " ".join(sorted(query_tokens))))
-    body_text = " ".join(re.findall(r"[a-z0-9]+", body))
-    query_seq = re.findall(r"[a-z0-9]+", query_text)
-    body_seq = re.findall(r"[a-z0-9]+", body)
+    # Sequences (not sets) for n-gram/phrase matching. `tokenize()` above is for
+    # overlap scoring; these use the CJK-aware ordered form so Han text yields
+    # Han unigram sequences (and therefore Han bigram n-grams) instead of
+    # collapsing to [] under the old ASCII-only regex.
+    body_seq = _cjk_sequence(body)
+    query_seq = _cjk_sequence(" ".join(sorted(query_tokens)))
+    query_text = " ".join(query_seq)
+    body_text = " ".join(body_seq)
 
     score = 0.0
 
@@ -372,7 +401,7 @@ def score_entry(entry, query_tokens, agent=None, project=None, relevant_refs=Non
     score += summary_hits * 3
 
     # 1b. Exact phrase and n-gram matches beat loose token overlap.
-    raw_query = " ".join(re.findall(r"[a-z0-9]+", entry.get("_query", "")))
+    raw_query = " ".join(_cjk_sequence(entry.get("_query", "")))
     if raw_query and raw_query in body_text:
         score += 18
     if query_seq:
@@ -387,7 +416,7 @@ def score_entry(entry, query_tokens, agent=None, project=None, relevant_refs=Non
     entry_tags = _as_list(entry.get("tags", []))
     tag_tokens = set()
     for t in entry_tags:
-        tag_tokens.update(re.findall(r"[a-z0-9]+", str(t).lower()))
+        tag_tokens.update(_cjk_sequence(str(t).lower()))
     tag_hits = len(query_tokens & tag_tokens)
     score += tag_hits * 4
 
@@ -559,7 +588,7 @@ def retrieve(query, max_results=5, max_tokens=2000, agent=None, project=None):
         return []
 
     query_tokens = tokenize(query)
-    query_words = re.findall(r"[a-z0-9]+", query.lower())
+    query_words = _cjk_sequence(query.lower())
     normalized_query = " ".join(query_words)
     for e in entries:
         e["_query"] = normalized_query

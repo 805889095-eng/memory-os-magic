@@ -30,14 +30,24 @@ if not AGENT_NAME and ".hermes-" in str(HERMES_HOME):
     AGENT_NAME = str(HERMES_HOME).split(".hermes-")[-1].rstrip("/")
 
 # ── Shared regexes (used by hooks.py and scoring) ────────
+# These regexes gate two things that silently never fire for Chinese: the
+# ``post_llm_call`` decision capture and ``score_session``'s decision component
+# (weight 3 of 10 — the single largest term). Upstream matched only English
+# verbs, so a Chinese session that fixed a bug and shipped a fix scored
+# decision=0.0 and was filtered out by on_session_end's 0.2 threshold, meaning
+# NOTHING was ever preserved from Chinese sessions. CJK alternatives are added
+# inline rather than as a separate pass so there is one authoritative pattern.
 DECISION_RE = re.compile(
     r"(?i)\b(decided|resolved|completed|fixed|deployed|shipped|reviewed|approved|rejected)\b"
+    r"|(决定|确定了|已解决|解决|修复|修好|已完成|完成|部署|上线|发布|合并|通过|批准|驳回|改用|改为|采用)"
 )
 OUTCOME_RE = re.compile(
     r"(?i)(result:|outcome:|conclusion:|because|root cause|instead of|\d+%|\d+x)"
+    r"|(结果|结论|原因是|根因|根本原因|实测|验证|报错|错误|失败|成功|全过|通过|提升|降到|从.*改)",
 )
 COMPLETION_RE = re.compile(
     r"(?i)\b(completed|finished|done|shipped|deployed|resolved|closed|merged|fixed)\b"
+    r"|(已完成|完成|搞定|修好|修复|部署|上线|合并|关闭|解决)"
 )
 
 # ── Entry-type whitelist ─────────────────────────────────

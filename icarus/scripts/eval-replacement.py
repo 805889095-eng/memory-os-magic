@@ -98,8 +98,15 @@ def call_model(model, prompt, api_key):
 
 
 def tokenize(text):
-    words = re.findall(r"[a-z0-9]+", text.lower())
-    return [w for w in words if w not in STOP_WORDS]
+    """CJK-aware tokens (ASCII words minus STOP_WORDS + Han bigrams).
+
+    Same fix as ``icarus/fabric-retrieve.py``: an ASCII-only regex scored
+    Chinese responses at 0.0, which would make eval-replacement report a false
+    regression on any Chinese fabric entry.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from cjk_tokens import tokenize as _cjk_tokenize
+    return list(_cjk_tokenize(text, stopwords=STOP_WORDS))
 
 
 def score_task_completion(response, expected):

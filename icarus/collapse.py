@@ -46,6 +46,8 @@ __all__ = [
 
 import re
 
+from . import cjk_tokens
+
 # Mild per-source priors. Curated/durable sources get a small nudge; this only
 # breaks ties between candidates of otherwise-equal salience. Kept close to 1.0
 # on purpose — query relevance should dominate, not source identity.
@@ -77,11 +79,20 @@ _STOPWORDS = frozenset(
 
 
 def tokenize(text: str) -> set:
-    """Lowercase alphanumeric tokens, minus stopwords. Pure and deterministic."""
-    if not text:
-        return set()
-    words = set(re.findall(r"[a-z0-9]+", str(text).lower()))
-    return words - _STOPWORDS
+    """CJK-aware scoring tokens (ASCII words minus stopwords + Han bigrams).
+
+    Upstream used an ASCII-only regex, so a Chinese query produced an EMPTY
+    token set. ``salience`` then computed overlap 0.0 for every candidate,
+    every candidate fell back to ``0.45 * base_score * source_prior``, and the
+    prune floor (0.35 * max_salience) cut everything except the highest-prior
+    source. Measured on a 3-candidate pool with a Chinese query: 1 survivor,
+    chosen by source prior rather than relevance. Delegating to cjk_tokens
+    fixes the ranking, not just the recall.
+
+    Kept as a module-level function with the same signature/return type because
+    ``hooks._apply_collapse`` and ``scripts/collapse_eval.py`` import it.
+    """
+    return cjk_tokens.tokenize(text, stopwords=_STOPWORDS)
 
 
 def _clamp01(x: float) -> float:

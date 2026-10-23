@@ -420,52 +420,58 @@ def search_knowledge_base(
 # ─── Fallback: Lexical Search in Vault ──────────────────────────────────────
 
 
+# Portuguese + English stopwords for the fallback lexical search. The upstream
+# set was inline in tokenize_query; hoisted so cjk_tokens can receive it.
+_PT_STOPWORDS = frozenset(
+    """
+    o a os as um uma de da do em no na para com por que se e ou mas
+    the an is are was were be been have has had do does did will would could should
+    """.split()
+)
+
+
 def tokenize_query(text: str) -> List[str]:
-    """Tokenize query into relevant terms (lowercase, alphanumeric)."""
-    # Remove basic Portuguese/English stopwords
-    stopwords = {
-        "o",
-        "a",
-        "os",
-        "as",
-        "um",
-        "uma",
-        "de",
-        "da",
-        "do",
-        "em",
-        "no",
-        "na",
-        "para",
-        "com",
-        "por",
-        "que",
-        "se",
-        "e",
-        "ou",
-        "mas",
-        "the",
-        "a",
-        "an",
-        "is",
-        "are",
-        "was",
-        "were",
-        "be",
-        "been",
-        "have",
-        "has",
-        "had",
-        "do",
-        "does",
-        "did",
-        "will",
-        "would",
-        "could",
-        "should",
-    }
-    tokens = re.findall(r"\b[a-zA-Z0-9]+\b", text.lower())
-    return [t for t in tokens if t not in stopwords and len(t) > 2]
+    """Tokenize a query into search terms, CJK-aware.
+
+    Both consumers of this list (``lexical_search_in_vault`` and
+    ``sqlite_keyword_search``) use ``LIKE '%term%'`` substring matching, so the
+    right unit for Chinese is a 2-char bigram — and the old
+    ``re.findall(r"\\b[a-zA-Z0-9]+\\b")`` returned an EMPTY list for any Chinese
+    query, which made both fallback levels dead ends. That mattered more than it
+    looks: the lexical and SQLite levels are exactly what runs when Qdrant or the
+    embedding API is down, so Chinese users silently lost knowledge-base recall
+    precisely during an outage.
+
+    The namespace is the cjk_tokens module. It is imported lazily because
+    scripts/ is a sibling of icarus/, not a subpackage of it.
+    """
+    tokens = _cjk_tokens().tokenize(text, stopwords=_PT_STOPWORDS, min_ascii_len=3)
+    # Ordered, deterministic: sorting keeps query construction reproducible.
+    return sorted(t for t in tokens if len(t) >= 2)
+
+
+def _cjk_tokens():
+    """Import the shared CJK tokenizer from scripts/ or from icarus/.
+
+    scripts/ and icarus/ are siblings, so neither is importable as a package
+    path from the other. Try both layouts, most specific first.
+    """
+    import importlib.util
+
+    for modname in ("icarus.cjk_tokens", "cjk_tokens"):
+        try:
+            return importlib.import_module(modname)
+        except ImportError:
+            continue
+    # Last resort: load by path relative to this file (repo root/icarus/).
+    here = Path(__file__).resolve().parent
+    cand = here.parent / "icarus" / "cjk_tokens.py"
+    if not cand.exists():
+        cand = here / "cjk_tokens.py"
+    spec = importlib.util.spec_from_file_location("icarus_cjk_tokens", cand)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def lexical_search_in_vault(
