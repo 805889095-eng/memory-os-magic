@@ -557,6 +557,130 @@ check("strip is idempotent", hooks._strip_scaffolding(_out) == _out)
 _plain = "## Context\n普通条目。\n\n## Outcome\n完成。"
 check("normal entry untouched", hooks._strip_scaffolding(_plain) == _plain)
 
+# ── 14. the report must not publish an unmeasurable usage_rate ────────────
+# usage_rate divides declared usages by recalls. Declarations come only from
+# fabric_write(review_of=...), which the agent never passes, so the number was
+# structurally 0.0 — and score_session() read it as a weight-2 component, so
+# every session silently lost 20% of its quality score against a
+# ``total < 0.2`` extraction gate. An automatic replacement was measured and
+# rejected: token overlap between a recalled summary and the ensuing reply is
+# indistinguishable from overlap with an unrelated reply (median 0.12 vs 0.14;
+# 110 recalled / 66 control samples).
+print("\n14. telemetry reports counts, not an invented usage rate")
+
+_sum = state._summarize_telemetry_events(
+    [
+        {"event": "recall", "result_ids": ["a", "b"]},
+        {"event": "recall", "result_ids": ["b", "c"]},
+        {"event": "usage", "entry_id": "a"},
+    ]
+)
+check("recall count kept", _sum["total_recalls"] == 2, str(_sum))
+check("declared usage count kept", _sum["total_usages"] == 1, str(_sum))
+check("unique recalled kept", _sum["unique_entries_recalled"] == 3, str(_sum))
+check("unique used kept", _sum["unique_entries_used"] == 1, str(_sum))
+check("usage_rate is not published", "usage_rate" not in _sum, str(_sum))
+
+_tel = state.get_telemetry(last_n=1)
+check(
+    "empty/telemetry summary has no usage_rate either",
+    "usage_rate" not in _tel["summary"],
+    str(_tel["summary"]),
+)
+
+
+# ── 14b. session scoring must not be pinned by an unmeasurable component ──
+# With usage_rate at a structural 0, recall_usage contributed 0/2 and the
+# maximum reachable total was 0.8 — then a real session with modest depth sank
+# under the 0.2 gate and its entries were never extracted.
+print("\n14b. session score is not deflated by the usage component")
+
+_saved_ex = state.exchanges
+_saved_sid = state.session_id
+_saved_tel = state.get_telemetry
+try:
+    # Two substantive turns: the old implementation's permanent 0.0 (weight 2)
+    # capped the total here. Measured (old vs new, isolated subprocesses):
+    #   exchanges  recalls=0        recalls>0
+    #   2          0.15 -> 0.15     0.15 -> 0.35
+    #   3          0.22 -> 0.22     0.22 -> 0.42
+    #   5          0.30 -> 0.30     0.30 -> 0.50
+    # So the fix only lifts sessions that actually recalled something — which
+    # is the honest claim. It does NOT rescue a session that recalled nothing.
+    state.exchanges = [
+        {"user": "u" * 60, "assistant": "## Result\n" + "a" * 150} for _ in range(2)
+    ]
+    state.session_id = "score-probe"
+
+    def _no_recalls(last_n=500, session_id_filter=None, agent_filter=None):
+        return {"events": [], "summary": {
+            "total_recalls": 0, "total_usages": 0,
+            "unique_entries_recalled": 0, "unique_entries_used": 0,
+        }}
+
+    state.get_telemetry = _no_recalls
+    _s0 = state.score_session()
+    check(
+        "component is named recall_activity",
+        "recall_activity" in _s0 and "recall_usage" not in _s0,
+        str(sorted(_s0)),
+    )
+    check(
+        "no recalls scores the component 0 (not a hidden penalty)",
+        _s0["recall_activity"] == 0.0,
+        str(_s0["recall_activity"]),
+    )
+    check(
+        "a session without recalls is not artificially lifted",
+        abs(_s0["total"] - 0.15) < 0.005,
+        f"total={_s0['total']} (both implementations score 0.15 here)",
+    )
+
+    def _some_recalls(last_n=500, session_id_filter=None, agent_filter=None):
+        return {"events": [], "summary": {
+            "total_recalls": 3, "total_usages": 0,
+            "unique_entries_recalled": 2, "unique_entries_used": 0,
+        }}
+
+    state.get_telemetry = _some_recalls
+    _s1 = state.score_session()
+    check(
+        "recalls lift the component",
+        _s1["recall_activity"] == 1.0,
+        str(_s1["recall_activity"]),
+    )
+    # The regression this fixes: a session that DID recall was still scored as
+    # if the layer had never fired, dropping it from 0.35 to 0.15 and below the
+    # ``total < 0.2`` extraction gate.
+    check(
+        "recalls lift the total by the component's weight",
+        abs((_s1["total"] - _s0["total"]) - 0.20) < 0.02,
+        f"{_s0['total']:.2f} -> {_s1['total']:.2f} (expected +0.20)",
+    )
+    check(
+        "a recalling session clears the 0.2 extraction gate",
+        _s1["total"] >= 0.2,
+        f"total={_s1['total']} (old implementation scored 0.15 here)",
+    )
+finally:
+    state.exchanges = _saved_ex
+    state.session_id = _saved_sid
+    state.get_telemetry = _saved_tel
+
+# The weekly report must say why the number is absent rather than just drop it.
+_report = state.build_weekly_report()
+check("report has a recall block", "recall" in _report, str(sorted(_report)))
+check(
+    "report carries no usage_rate",
+    "usage_rate" not in _report.get("recall", {}),
+    str(_report.get("recall")),
+)
+check(
+    "report explains the omission",
+    "usage_rate" in (_report.get("notes") or {}),
+    str(_report.get("notes")),
+)
+
 print("\n" + "=" * 64)
 print(f"pass {len(PASS)} / fail {len(FAIL)}")
 for label, detail in FAIL:

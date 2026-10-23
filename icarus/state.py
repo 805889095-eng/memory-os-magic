@@ -185,7 +185,21 @@ _recall_log: list = []
 
 
 def _summarize_telemetry_events(events):
-    """Compute telemetry summary for a filtered event list."""
+    """Compute telemetry summary for a filtered event list.
+
+    ``total_recalls`` / ``unique_entries_recalled`` count what actually
+    happened: fabric entries surfaced at least once as a recall candidate.
+
+    ``total_usages`` / ``unique_entries_used`` count an EXPLICIT declaration
+    only — the agent passing ``review_of`` / ``revises`` to ``fabric_write``.
+    There is deliberately no ``usage_rate``: a rate needs a reliable notion of
+    "this entry was used", and an automatic one does not exist here. Measured
+    on the live store, token overlap between a recalled entry's summary and the
+    ensuing reply is indistinguishable from overlap between that summary and an
+    unrelated reply (medians 0.12 vs 0.14 over 110 recalled / 66 control
+    samples) — a threshold on it would report vocabulary coincidence as usage.
+    A declared 0 is honest; an inferred rate is not.
+    """
     recalls = [e for e in events if e.get("event") == "recall"]
     usages = [e for e in events if e.get("event") == "usage"]
     recalled_ids = set()
@@ -200,7 +214,6 @@ def _summarize_telemetry_events(events):
         "total_usages": sum(1 for u in usages if u.get("entry_id", "") in recalled_ids),
         "unique_entries_recalled": len(recalled_ids),
         "unique_entries_used": len(used_from_recall),
-        "usage_rate": round(len(used_from_recall) / max(len(recalled_ids), 1), 2),
     }
 
 
@@ -267,7 +280,6 @@ def get_telemetry(last_n=50, session_id_filter=None, agent_filter=None):
         "total_usages": 0,
         "unique_entries_recalled": 0,
         "unique_entries_used": 0,
-        "usage_rate": 0.0,
     }
     if not _TELEMETRY_FILE.exists():
         return {"events": [], "summary": empty_summary}
@@ -1563,7 +1575,14 @@ def score_session():
     tel = get_telemetry(
         last_n=500, session_id_filter=session_id, agent_filter=AGENT_NAME
     )
-    scores["recall_usage"] = tel.get("summary", {}).get("usage_rate", 0.0)
+    # Was anything recalled for this session at all? That is the signal this
+    # component can honestly report. It used to read ``usage_rate`` — a value
+    # that is structurally 0 because it needs explicit ``review_of``
+    # declarations (see ``_summarize_telemetry_events``), so this component
+    # contributed a permanent 0 with weight 2, deflating every session's total
+    # by 20% and pushing sessions toward the ``total < 0.2`` extraction gate.
+    recalled = tel.get("summary", {}).get("total_recalls", 0)
+    scores["recall_activity"] = 1.0 if recalled > 0 else 0.0
 
     scores["linked_entries"] = min(_count_session_linked_entries() / 2, 1.0)
 
@@ -1575,7 +1594,7 @@ def score_session():
     weights = {
         "depth": 2,
         "decision": 3,
-        "recall_usage": 2,
+        "recall_activity": 2,
         "linked_entries": 2,
         "user_engagement": 1,
     }
@@ -1588,22 +1607,22 @@ def score_session():
 # ── Corpus reporting ─────────────────────────────────────
 
 
-def get_entry_usage_stats():
-    """Per-entry-type recall and usage rates from telemetry."""
+def get_recall_breakdown():
+    """Per-entry-type RECALL counts from telemetry.
+
+    Recalls only — no ``used`` / ``usage_rate`` columns. Those depended on
+    ``fabric_write(review_of=...)`` declarations, which never arrive, and there
+    is no reliable automatic substitute (see ``_summarize_telemetry_events``).
+    Reporting a per-type rate of 0.0 implied "these entries never help", which
+    is not what the data says; it says nobody declared anything.
+    """
     tel = get_telemetry(last_n=500)
     recalled_ids = set()
-    used_ids = set()
     for event in tel.get("events", []):
         if event.get("event") == "recall":
             recalled_ids.update(event.get("result_ids", []))
-        elif event.get("event") == "usage":
-            eid = event.get("entry_id", "")
-            if eid:
-                used_ids.add(eid)
-    used_ids &= recalled_ids
 
     type_recalled: dict = {}
-    type_used: dict = {}
     if FABRIC_DIR.exists():
         for f in FABRIC_DIR.glob("*.md"):
             h = _parse_head(f)
@@ -1611,20 +1630,10 @@ def get_entry_usage_stats():
             etype = h.get("type", "unknown")
             if eid in recalled_ids:
                 type_recalled[etype] = type_recalled.get(etype, 0) + 1
-            if eid in used_ids:
-                type_used[etype] = type_used.get(etype, 0) + 1
 
-    all_types = sorted(set(list(type_recalled.keys()) + list(type_used.keys())))
     return {
         "by_type": {
-            t: {
-                "recalled": type_recalled.get(t, 0),
-                "used": type_used.get(t, 0),
-                "usage_rate": round(
-                    type_used.get(t, 0) / max(type_recalled.get(t, 0), 1), 2
-                ),
-            }
-            for t in all_types
+            t: {"recalled": n} for t, n in sorted(type_recalled.items())
         },
     }
 
@@ -1653,7 +1662,7 @@ def build_weekly_report():
             if entry_id:
                 trainable_ids.add(str(entry_id))
 
-    usage_stats = get_entry_usage_stats()
+    recall_breakdown = get_recall_breakdown()
     tel = get_telemetry(last_n=200)
 
     return {
@@ -1661,9 +1670,16 @@ def build_weekly_report():
         "by_type": by_type,
         "by_training_value": by_tv,
         "verified_entries": verified_count,
-        "recall_usage": tel.get("summary", {}),
-        "usage_by_type": usage_stats.get("by_type", {}),
+        "recall": tel.get("summary", {}),
+        "recalled_by_type": recall_breakdown.get("by_type", {}),
         "trainable_estimate": len(trainable_ids),
+        "notes": {
+            "usage_rate": "not reported — needs a reliable 'this entry was used' "
+            "signal; token overlap was measured against a random-entry control "
+            "and did not separate (median 0.12 recalled vs 0.14 control). "
+            "total_usages counts only explicit fabric_write(review_of=...) "
+            "declarations.",
+        },
     }
 
 
