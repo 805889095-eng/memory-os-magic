@@ -130,11 +130,16 @@ async def main():
     failures = []
 
     for rel_path in files_to_ingest:
-        abs_path = str(WIKI_ROOT / rel_path)
+        # The worker resolves this path on its own filesystem. Docker maps the
+        # wiki into the container at /wiki, so that prefix was hardcoded — which
+        # made a host install enqueue an unreadable path (FileNotFoundError:
+        # /wiki/... does not exist on the host). WIKI_PATH_CONTAINER pins the
+        # container prefix when it differs from the host WIKI_ROOT.
+        container_wiki = os.environ.get("WIKI_PATH_CONTAINER") or "/wiki"
         try:
             job = await redis.enqueue_job(
                 "process_wiki_file",
-                file_path=f"/wiki/{rel_path}",  # path dentro do container
+                file_path=f"{container_wiki.rstrip('/')}/{rel_path}",
             )
             state[rel_path]["ingested_at"] = datetime.now(timezone.utc).isoformat()
             enqueued += 1
