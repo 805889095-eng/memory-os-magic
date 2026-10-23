@@ -297,6 +297,46 @@ finally:
     _urlreq.urlopen = _orig_urlopen
     hooks._resolve_llm_api_key = _orig_key
 
+# ── 11. fact excerpts must window on the match, not the head ──────────────
+# _search_facts used to return content[:200]. Facts are multi-section markdown,
+# so the query terms routinely land past offset 200: one fact had "token" at
+# 252 behind an unrelated preamble. The injected excerpt then had zero overlap
+# with the query, and the collapse pruner — which scores candidates by token
+# overlap — dropped every fact candidate as noise. [facts] silently vanished
+# from the prompt even though the layer had found real hits.
+print("\n11. fact excerpt windowing")
+
+_probe = "A" * 250 + "token 泄露风险在这里" + "B" * 300
+_ex = hooks._fact_excerpt(_probe, ["token"])
+check("excerpt contains the match past offset 200", "token" in _ex, repr(_ex[:80]))
+check("excerpt is bounded", len(_ex) <= 210, str(len(_ex)))
+check("excerpt marks the elision", _ex.startswith("…"), repr(_ex[:10]))
+
+_short = "很短的一条事实"
+check("short fact returned whole", hooks._fact_excerpt(_short, ["token"]) == _short)
+
+_no_hit = "C" * 500
+check(
+    "no term present falls back to the head slice",
+    hooks._fact_excerpt(_no_hit, ["token"]) == "C" * 200,
+)
+
+check(
+    "ascii query words are picked up for windowing",
+    hooks._query_words("token 泄露") == ["token"],
+    str(hooks._query_words("token 泄露")),
+)
+
+# End to end: a fact whose match sits past 200 chars must keep query overlap
+# in the excerpt the collapse ranker sees.
+_deep_content = "无关前言。" * 60 + "token 泄露的处理办法"
+_ex2 = hooks._fact_excerpt(_deep_content, hooks._query_words("token"))
+check(
+    "deep match survives into the excerpt",
+    "token" in _ex2,
+    repr(_ex2[-60:]),
+)
+
 print("\n" + "=" * 64)
 print(f"pass {len(PASS)} / fail {len(FAIL)}")
 for label, detail in FAIL:

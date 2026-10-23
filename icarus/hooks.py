@@ -704,6 +704,57 @@ def _facts_db_candidates():
     return cands
 
 
+def _query_words(query: str):
+    """ASCII words from a query, for excerpt windowing.
+
+    ``cjk_terms`` only carries Han bigrams, so an ASCII query ("token") yielded
+    no terms at all and the excerpt fell back to the head slice — the exact case
+    that hid the match.
+    """
+    return [w for w in re.findall(r"[A-Za-z][A-Za-z0-9_\-]{2,}", str(query or ""))]
+
+
+def _fact_excerpt(content: str, terms, width: int = 200) -> str:
+    """Excerpt of ``content`` centred on the earliest query-term hit.
+
+    A head slice is wrong for a fact store: entries are multi-section markdown
+    (## Context / ## Decision / ...), and the query terms frequently land past
+    offset 200. The excerpt is what gets injected AND what the collapse ranker
+    scores for query overlap, so a head slice with no query terms made every
+    fact candidate look like noise (overlap 0.0) and get pruned.
+
+    Falls back to the head slice when no term is present (short facts, or an
+    FTS hit produced by a stem the caller did not pass).
+    """
+    text = str(content or "")
+    if len(text) <= width:
+        return text
+
+    lowered = text.lower()
+    positions = []
+    for term in terms or ():
+        term = str(term or "").strip()
+        if not term:
+            continue
+        idx = lowered.find(term.lower())
+        if idx != -1:
+            positions.append(idx)
+
+    if not positions:
+        return text[:width]
+
+    # Keep a quarter of the window as leading context so the excerpt does not
+    # start mid-word, then clamp to the tail when the hit is near the end.
+    start = max(0, min(positions) - width // 4)
+    end = start + width
+    if end > len(text):
+        end = len(text)
+        start = max(0, end - width)
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(text) else ""
+    return f"{prefix}{text[start:end]}{suffix}"
+
+
 def _search_facts(query, top_k=3):
     """FTS5 search over durable facts in memory_store.db, rank-score reranked.
 
@@ -782,9 +833,17 @@ def _search_facts(query, top_k=3):
         age = evolution.fact_age_days(
             r["updated_at"] if "updated_at" in keys else r["created_at"]
         )
+
+        # Excerpt around the match, not the first 200 chars. FTS matched the
+        # full text, but a head slice can contain none of the query terms: one
+        # fact had "token" at offset 252 behind an unrelated 250-char preamble,
+        # so the injected excerpt had zero overlap with the query and the
+        # collapse pruner dropped every fact candidate as noise. Window the
+        # excerpt on the earliest hit and keep a little leading context.
+        excerpt = _fact_excerpt(content, list(cjk_terms or []) + _query_words(query), 200)
         rec = {
             "fact_id": int(r["fact_id"]),
-            "content": str(content)[:200],
+            "content": excerpt,
             "trust_score": float(trust or 0.0),
             "retrieval_count": int(count or 0),
             "score": evolution.rank_score(trust, count, age),
